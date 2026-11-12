@@ -1,8 +1,6 @@
-# Outline-Driven Development: Reflector
+# DStack Reflector
 
-> Review layer for Outline-Driven Development. Add-on for the Claude Code plugin, with a native oh-my-pi port.
-
-**Methodology**: [outline-driven-development](https://github.com/OutlineDriven/outline-driven-development) &nbsp;·&nbsp; **Claude Code plugin**: [odin-claude-plugin](https://github.com/OutlineDriven/odin-claude-plugin) &nbsp;·&nbsp; **Site**: [outlinedriven.github.io](https://outlinedriven.github.io)
+> Review layer for DStack. Add-on for the Claude Code plugin, with a native oh-my-pi port.
 
 ---
 
