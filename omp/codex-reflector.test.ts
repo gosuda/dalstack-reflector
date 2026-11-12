@@ -36,10 +36,6 @@ import codexReflector, {
 	UI_DIMENSIONS,
 } from "./codex-reflector.ts";
 
-// ---------------------------------------------------------------------------
-// Judge fakes: answers drive every verdict-route test through testSetJudge.
-// ---------------------------------------------------------------------------
-
 interface ContentResult {
 	content?: Array<{ type: string; text: string }>;
 	isError?: boolean;
@@ -768,16 +764,13 @@ describe("factory", () => {
 		}
 	});
 
-	// Stop-review settle contract: only a FAIL at BLOCK_AT may return a block decision,
-	// and every settle must stay silent (no pi.sendMessage) — a conversation message
-	// re-enters the agent loop and loops the Stop up to the harness continuation cap.
 	const STOP_CASES: ReadonlyArray<{ name: string; defect: number; blocks: boolean }> = [
 		{ name: "blocks exactly at 0.9", defect: 0.9, blocks: true },
 		{ name: "settles just below 0.9", defect: 0.8999, blocks: false },
 		{ name: "settles on a clean PASS", defect: 0.05, blocks: false },
 	];
 	for (const c of STOP_CASES) {
-		test(`session_stop ${c.name}`, async () => {
+		test(`session_stop ${c.name} with no conversation message`, async () => {
 			const restore = setEnv("CODEX_REFLECTOR_STOP_REVIEW", "1");
 			let capturedState: Record<string, string> | undefined;
 			testSetJudge(async (state) => {
@@ -916,8 +909,6 @@ describe("factory", () => {
 		}
 	});
 
-	// Per-tool code review is advisory: every verdict rides along as appended
-	// content and NONE sets isError, so a succeeded edit is never blocked.
 	const WRITE_CASES: ReadonlyArray<{ name: string; answers: Record<string, Answer> }> = [
 		{ name: "PASS", answers: writeAnswers() },
 		{
@@ -2258,7 +2249,7 @@ describe("handlerDeadline", () => {
 		const ac = new AbortController();
 		const d = handlerDeadline(ac.signal, 10_000);
 		d.clear();
-		ac.abort(); // fires AFTER clear — must not reach the deadline's controller
+		ac.abort();
 		expect(d.signal.aborted).toBe(false);
 	});
 });
@@ -2312,18 +2303,18 @@ describe("resolveChangeTarget", () => {
 		const r = resolveChangeTarget(
 			evt("edit", { input: "[other.ts#AAAA]\n..." }, { path: "real.ts", diff: "@@ -1 +1 @@" }),
 		);
-		expect(r.filePath).toBe("real.ts"); // details.path, not the hashline header
-		expect(r.rawSnippet).toBe("@@ -1 +1 @@"); // details.diff
+		expect(r.filePath).toBe("real.ts");
+		expect(r.rawSnippet).toBe("@@ -1 +1 @@");
 	});
 
 	test("edit falls back to the hashline header when details absent", () => {
 		const r = resolveChangeTarget(evt("edit", { input: "[fallback.ts#BBBB]\nbody" }, undefined));
 		expect(r.filePath).toBe("fallback.ts");
 	});
-	test("ast_edit -> per-path filePaths for multi-file edits (BE-R2)", () => {
+	test("ast_edit -> joined display path in filePath, per-path filePaths for multi-file edits", () => {
 		const r = resolveChangeTarget(evt("ast_edit", { paths: ["a.ts", "b.ts"] }));
-		expect(r.filePath).toBe("a.ts, b.ts"); // joined display key
-		expect(r.filePaths).toEqual(["a.ts", "b.ts"]); // per-path state keys
+		expect(r.filePath).toBe("a.ts, b.ts");
+		expect(r.filePaths).toEqual(["a.ts", "b.ts"]);
 	});
 
 	test("MCP Fast-Apply success snippet includes code_edit/instruction payload (CQ-R1)", () => {
@@ -2331,8 +2322,8 @@ describe("resolveChangeTarget", () => {
 			evt("mcp__morph__edit_file", { path: "m.ts", code_edit: "EDIT-SKETCH", instruction: "DO-X" }),
 		);
 		expect(r.filePath).toBe("m.ts");
-		expect(r.rawSnippet).toContain("DO-X"); // instruction
-		expect(r.rawSnippet).toContain("EDIT-SKETCH"); // code_edit sketch
+		expect(r.rawSnippet).toContain("DO-X");
+		expect(r.rawSnippet).toContain("EDIT-SKETCH");
 	});
 
 	test("native fast_edit uses target_filepath and plural instructions", () => {

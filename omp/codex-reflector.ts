@@ -1,59 +1,16 @@
-/**
- * codex-reflector — native oh-my-pi (Pi) hook.
- *
- * Routes oh-my-pi events to one reviewer, the omp judge role: a typed
- * decision-model judge whose probability answers the reflector turns into a
- * verdict in code. A TypeScript port of `scripts/codex-reflector.py` (the
- * Claude Code / Cursor plugin); no Python runtime dependency.
- *
- * Routes (oh-my-pi native tool names):
- *   - write review:   write / edit / ast_edit / fast_edit + Fast-Apply MCP (success)
- *                      -> tool_result content (advisory, every verdict; never blocks)
- *   - bash pre-guard: bash (prescreen-matched, before execution)            -> block on FAIL only
- *   - stop review:    session_stop (PASS/UNCERTAIN, fresh review)           -> settle (UI notice only)
- *   - FAIL enforce:   session_stop (FAIL, fresh review)                     -> continue (block decision)
- *   - abort settle:   session_stop (settled turn aborted)                   -> settle silently, no review
- *
- * Delivery-channel rule: code-change reviews are advisory — oh-my-pi applies a
- * tool_result `content` override on the SUCCESS path for every verdict and the
- * review never sets isError, so a succeeded edit is never rethrown as a failed
- * tool call. An error result is left untouched. The bash tool_call guard is a
- * prescreen-triggered pre-execution FAIL-only block: only commands matching a
- * coarse local risk pattern reach the judge; holistic Stop remains the only
- * post-hoc blocking gate.
- *
- * Env vars: CODEX_REFLECTOR_ENABLED ("0" disables), CODEX_REFLECTOR_BASH_GUARD
- * ("1" enables opt-in bash pre-guard, "0" disables), CODEX_REFLECTOR_STOP_REVIEW
- * ("1" enables opt-in stop review, "0" disables), CODEX_REFLECTOR_DEBUG ("1" for
- * logger diagnostics).
- */
-
 import type { Answer, JudgmentResult, NoulQuestion, Questions, ScoreQuestion } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ToolResultEvent, ToolResultEventResult } from "@oh-my-pi/pi-coding-agent";
 import type { JudgeDeps } from "@oh-my-pi/pi-coding-agent/judgment";
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
 const DEBUG = process.env.CODEX_REFLECTOR_DEBUG === "1";
 
-// Per-handler budget shared across the judge round-trips in one handler
-// invocation. The harness caps a handler at 30 s (EXTENSION_HANDLER_TIMEOUT_MS)
-// without aborting it, so this budget must stay under that cap.
 export const HANDLER_BUDGET_MS = 25_000;
 let handlerBudgetMs = HANDLER_BUDGET_MS;
-/** Test-only: shrink the per-handler budget so the deadline can be exercised
- *  without a 25s wait. Restore with testSetHandlerBudgetMs(HANDLER_BUDGET_MS). */
 export function testSetHandlerBudgetMs(ms: number): void {
 	handlerBudgetMs = ms;
 }
 
 export type Verdict = "PASS" | "FAIL" | "UNCERTAIN";
-
-// ---------------------------------------------------------------------------
-// Unknown-shape access (duck-typing for event payloads we do not own)
-// ---------------------------------------------------------------------------
 
 function getProp(obj: unknown, key: string): unknown {
 	return obj !== null && typeof obj === "object"
@@ -61,8 +18,6 @@ function getProp(obj: unknown, key: string): unknown {
 		: undefined;
 }
 
-/** stopReason of the turn being settled: the event's last_assistant_message,
- * else the last assistant entry in messages. */
 function settledStopReason(event: unknown): string | undefined {
 	const direct = getProp(getProp(event, "last_assistant_message"), "stopReason");
 	if (typeof direct === "string") return direct;
@@ -85,11 +40,6 @@ function pickString(input: Record<string, unknown>, keys: readonly string[], fal
 	return fallback;
 }
 
-// ---------------------------------------------------------------------------
-// Diagnostics — best-effort, routed to the agent logger (never stdout/stderr,
-// which hooks share with the agent's own streams).
-// ---------------------------------------------------------------------------
-
 let logger: unknown;
 
 function debug(msg: string): void {
@@ -100,12 +50,9 @@ function debug(msg: string): void {
 		const info = getProp(logger, "info");
 		if (typeof dbg === "function") (dbg as (m: string) => void).call(logger, line);
 		else if (typeof info === "function") (info as (m: string) => void).call(logger, line);
-	} catch {
-		/* logging is best-effort */
-	}
+	} catch {}
 }
 
-/** Best-effort UI notification: silent in headless mode, never throws. */
 export function notifyUI(
 	ctx: { hasUI: boolean; ui: { notify(msg: string, level?: "info" | "warning" | "error"): void } },
 	msg: string,
@@ -113,14 +60,8 @@ export function notifyUI(
 ): void {
 	try {
 		if (ctx.hasUI) ctx.ui.notify(msg, level);
-	} catch {
-		/* UI is optional */
-	}
+	} catch {}
 }
-
-// ---------------------------------------------------------------------------
-// Security hardening
-// ---------------------------------------------------------------------------
 
 const SECRET_PATTERNS: readonly RegExp[] = [
 	/(api[_-]?key|secret|token|password|credential|auth)\s*[=:]\s*\S+/gi,
@@ -137,10 +78,6 @@ export function redact(text: string): string {
 	for (const pattern of SECRET_PATTERNS) out = out.replace(pattern, "[REDACTED]");
 	return out;
 }
-
-// ---------------------------------------------------------------------------
-// Decision-model judge contract
-// ---------------------------------------------------------------------------
 
 export const FAIL_AT_ADVISORY = 0.7;
 export const PASS_BELOW = 0.3;
@@ -606,13 +543,10 @@ type JudgeFn = (
 
 let judgeOverride: JudgeFn | undefined;
 
-/** Test-only: replace the lazy host judge. Restore with testSetJudge(undefined). */
 export function testSetJudge(fn: JudgeFn | undefined): void {
 	judgeOverride = fn;
 }
 
-/** The host judge resolves through a lazy import so this module loads, and the
- * tests run, without the host package on disk. */
 export async function invokeJudge(
 	state: Record<string, string>,
 	questions: Questions,
@@ -730,22 +664,14 @@ function partStates(
 	});
 }
 
-// ---------------------------------------------------------------------------
-// Tool routing — oh-my-pi native tool names
-// ---------------------------------------------------------------------------
-
 const CODE_CHANGE_TOOLS: Record<string, true> = {
 	write: true,
 	edit: true,
 	ast_edit: true,
 	fast_edit: true,
 };
-// Explicit edit-function marker only: bare Morph server markers would route
-// non-edit Morph tools (fastcompact, warpgrep) into code-change review.
 const MCP_EDIT_MARKERS = ["__edit_file"];
 
-/** True when a tool result is a code change worth the write review: the native
- * mutators, or an MCP tool whose name carries the edit-function marker. */
 export function isCodeChangeTool(toolName: string): boolean {
 	return (
 		Object.hasOwn(CODE_CHANGE_TOOLS, toolName) ||
@@ -753,19 +679,8 @@ export function isCodeChangeTool(toolName: string): boolean {
 	);
 }
 
-// A workspace file path never carries a URI scheme; a scheme means the write
-// targets a device or internal location, not a source file to review.
 const URI_SCHEME_RE = /^([a-z][a-z0-9+.-]*):\/\//i;
 
-/**
- * Mounted `xd://` tools execute through the outer `write` transport. The
- * completed result carries the canonical inner dispatch in `details.xdev`;
- * retain its tool name, validated arguments, and result details so every
- * existing route sees the same shape as a direct tool call.
- *
- * A missing dispatch is a legacy or plain write. The URL fallback only exists
- * for older hosts that do not attach `details.xdev`.
- */
 interface ReviewEvent {
 	toolName: string;
 	input: Record<string, unknown>;
@@ -817,22 +732,11 @@ export function resolveDeviceWrite(event: ToolResultEvent): ReviewEvent | null {
 			const parsed: unknown = JSON.parse(rawArgs);
 			if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed))
 				input = parsed as Record<string, unknown>;
-		} catch {
-			/* legacy unparseable args: retain the tool name and empty arguments */
-		}
+		} catch {}
 	}
 	return { ...event, toolName: device, input };
 }
 
-// ---------------------------------------------------------------------------
-// Handler deadline
-// ---------------------------------------------------------------------------
-
-/** Per-handler deadline: an AbortController that aborts after `budgetMs`
- * (default = the test-settable handlerBudgetMs, under oh-my-pi's 30s handler
- * cap), optionally chained to an upstream signal (aborts if either fires).
- * Caller MUST call clear() in finally to cancel the timer and detach the
- * upstream listener. */
 export interface HandlerDeadline {
 	signal: AbortSignal;
 	clear: () => void;
@@ -857,10 +761,6 @@ export function handlerDeadline(
 		},
 	};
 }
-
-// ---------------------------------------------------------------------------
-// Content extraction (oh-my-pi tool_result / message shapes -> text)
-// ---------------------------------------------------------------------------
 
 function partText(part: unknown): string {
 	if (typeof part === "string") return part;
@@ -897,7 +797,6 @@ export function renderTranscript(messages: readonly unknown[]): string {
 	return blocks.join("\n\n");
 }
 
-/** Resolve the review target (display path, state keys, raw snippet) from a code-change result. Sync, pure. */
 export function resolveChangeTarget(event: ReviewEvent): {
 	filePath: string;
 	filePaths: string[];
@@ -920,22 +819,19 @@ export function resolveChangeTarget(event: ReviewEvent): {
 		filePath = paths.join(", ") || "unknown";
 		rawSnippet = textOf(event.content);
 	} else if (event.toolName === "edit") {
-		// EditToolDetails carries `path` + unified `diff` across every edit mode;
-		// `input.input` exists only in hashline mode, so prefer details first.
 		const detailPath = getProp(details, "path");
 		const detailDiff = getProp(details, "diff");
 		if (typeof detailPath === "string" && detailPath) {
 			filePath = detailPath;
 		} else {
-			const patch = typeof input.input === "string" ? input.input : "";
-			const match = patch.match(/^\[([^\]#]+)#/m);
+			const hashlinePatch = typeof input.input === "string" ? input.input : "";
+			const match = hashlinePatch.match(/^\[([^\]#]+)#/m);
 			filePath = match ? match[1] : "unknown";
 		}
 		filePaths = [filePath];
 		rawSnippet =
 			typeof detailDiff === "string" && detailDiff ? detailDiff : textOf(event.content);
 	} else {
-		// MCP edit-marker or native fast_edit success: review the edit sketch, not just the status message.
 		filePath = pickString(input, ["path", "file_path", "target_filepath"], "unknown");
 		filePaths = [filePath];
 		const codeEdit = typeof input.code_edit === "string" ? input.code_edit : "";
@@ -953,14 +849,6 @@ export function resolveChangeTarget(event: ReviewEvent): {
 	return { filePath, filePaths, rawSnippet };
 }
 
-// ---------------------------------------------------------------------------
-// Review response builder
-// ---------------------------------------------------------------------------
-
-/** Build the tool_result result for an advisory code-change review. The verdict
- * + opinion ride along as a content override and the result never sets isError,
- * so a succeeded edit is never blocked. Holistic Stop remains the only post-hoc
- * blocking gate; bashGuardDecision governs the separate pre-execution bash gate. */
 export function codeReviewResponse(
 	verdict: Verdict,
 	filePath: string,
@@ -976,10 +864,6 @@ export function codeReviewResponse(
 	return result;
 }
 
-/** Map a holistic Stop-review verdict to its settle decision: only a definitive
- * FAIL blocks the stop (fail-closed) with the review as the continuation reason
- * (Claude/Codex-compatible `decision` shape, matching the Python plugin). PASS
- * and UNCERTAIN settle (fail-open — never block on uncertainty). */
 export function stopReviewDecision(
 	verdict: Verdict,
 	out: string,
@@ -988,9 +872,6 @@ export function stopReviewDecision(
 	return { decision: "block", reason: `Reflector Stop Review FAIL:\n${out}` };
 }
 
-/** Map the bash pre-guard's largest yes-probability to its gate decision: only a
- * maximum at or above BLOCK_AT blocks the command before execution; anything
- * lower lets it run (fail-open: never block on uncertainty or infra failure). */
 export function bashGuardDecision(
 	maxProbability: number,
 	categoryText: string,
@@ -1003,41 +884,19 @@ export function bashGuardDecision(
 	};
 }
 
-// Coarse risk signals that warrant a judge adjudication. This is a COST gate,
-// not a security boundary: quoted/echoed text over-triggers (the judge then
-// adjudicates) and misses run unreviewed — the guard's documented fail-open
-// posture. Minimal and generous by design: routine dev commands never pay
-// the judge round-trip. Taxonomy mirrors BASH_GUARD_CATEGORIES: extend both
-// together.
 const BASH_GUARD_TRIGGERS: ReadonlyArray<RegExp> = [
-	// deletion reaching outside the workspace: rm/rip touching /, ~, $HOME, or ..
 	/\b(rm|rip)\b[^\n;|&]*(\s\/|~|\$\{?HOME|\.\.)/,
-	// raw-device / filesystem destruction
 	/\b(dd|mkfs\S*|shred|wipefs)\b/,
-	// untracked-purge and find -delete sweeps
 	/\bgit\s+clean\b|\bfind\b[^\n]*-delete\b/,
-	// shared-history rewrite / force push
 	/\bpush\b[^\n]*(--force|\s-\w*f\w*\b)|\breset\s+--hard\b|\bfilter-branch\b/,
-	// remote content piped into a shell
 	/\b(curl|wget)\b[^\n|]*\|[^\n]*\b(ba|z|da)?sh\b/,
-	// privilege escalation / system-path writes (benign /dev/null-family
-	// redirect targets stay free — they are the pervasive shell idiom)
 	/\bsudo\b|\btee\b[^\n]*\s\/etc\/|>>?\s*\/(etc|boot)\/|>>?\s*\/dev\/(?!(?:null|stdout|stderr|zero|tty)\b)/,
-	// machine state + arbitrary process kills (bare `kill` stays free)
 	/\b(shutdown|reboot|halt|poweroff|pkill|killall)\b/,
-	// key material named together with a network sender
 	/(\.ssh\b|id_rsa|id_ed25519|\.aws\b|credentials)[^\n]*\b(curl|wget|nc|ncat|scp|rsync)\b|\b(curl|wget|nc|ncat|scp|rsync)\b[^\n]*(\.ssh\b|id_rsa|id_ed25519|\.aws\b|credentials)/,
 ];
 
-// Bound the regex work: unbounded-span alternations go quadratic on
-// multi-token single-line input — synchronous CPU no deadline can interrupt.
-// Measured worst case at 4096 chars is ~10ms (key-material trigger) after
-// pinning the curl|sh trigger's first span to [^\n|]* (was ~900ms with two
-// unbounded spans). Oversized commands skip the prescreen and go straight to
-// the judge (the pre-prescreen baseline cost), so no bypass opens.
 const PRESCREEN_MAX_SCAN = 4096;
 
-/** True when the command matches a coarse risk signal worth a judge adjudication. */
 export function bashGuardPrescreen(command: string): boolean {
 	if (command.length > PRESCREEN_MAX_SCAN) return true;
 	return BASH_GUARD_TRIGGERS.some((re) => re.test(command));
@@ -1063,10 +922,6 @@ export function isStopReviewEnabled(pi: ExtensionAPI): boolean {
 	return flag === true || flag === "1" || flag === "true";
 }
 
-// ---------------------------------------------------------------------------
-// Hook factory
-// ---------------------------------------------------------------------------
-
 export default function codexReflector(pi: ExtensionAPI): void {
 	if (process.env.CODEX_REFLECTOR_ENABLED === "0") return;
 	logger = pi.logger;
@@ -1082,8 +937,6 @@ export default function codexReflector(pi: ExtensionAPI): void {
 		default: false,
 	});
 
-
-	// Advisory write review on each tool result (success path only).
 	pi.on("tool_result", async (event, ctx) => {
 		let deadline: HandlerDeadline | undefined;
 		try {
@@ -1106,7 +959,7 @@ export default function codexReflector(pi: ExtensionAPI): void {
 			return codeReviewResponse(judged.verdict, filePath, judged.scorecard, ev.content);
 		} catch (err) {
 			debug(`tool_result handler error: ${String(err)}`);
-			return undefined; // fail-open
+			return undefined;
 		} finally {
 			deadline?.clear();
 		}
@@ -1119,7 +972,7 @@ export default function codexReflector(pi: ExtensionAPI): void {
 			const input = getProp(event, "input");
 			const command = getProp(input, "command");
 			if (typeof command !== "string" || !command) return undefined;
-			if (!bashGuardPrescreen(command)) return undefined; // benign: zero judge cost
+			if (!bashGuardPrescreen(command)) return undefined;
 			const cwd = ctx.cwd || process.cwd();
 			const states = partStates(chunkText(redact(command)), "command", {}, { cwd: redact(cwd) });
 			deadline = handlerDeadline();
@@ -1158,17 +1011,11 @@ export default function codexReflector(pi: ExtensionAPI): void {
 		}
 	});
 
-	// session_stop (omp 16.0.5, #2834): main-session-only Stop analog, awaited
-	// before the turn settles, bounded by omp's built-in 8-continuation cap.
 	pi.on("session_stop", async (event, ctx) => {
 		let deadline: HandlerDeadline | undefined;
 		try {
 			if (!isStopReviewEnabled(pi)) return undefined;
 			if (getProp(event, "stop_hook_active") === true) return undefined;
-			// Claude-Code parity for aborted-tail settles (its Stop hook never fires on
-			// user interrupt). omp >=16.x suppresses these emissions itself; this keeps
-			// the contract explicit if that drifts. The Esc-after-message_end race emits
-			// stopReason "stop" with no abort signal — upstream issue, not observable here.
 			if (settledStopReason(event) === "aborted") return undefined;
 			const lastMessage = getProp(event, "last_assistant_message");
 			const lastText = textOf(getProp(lastMessage, "content"));
@@ -1182,11 +1029,6 @@ export default function codexReflector(pi: ExtensionAPI): void {
 			deadline = handlerDeadline();
 			const judged = await judgeRoute("stop", ctx, states, questions, oneChunk, deadline.signal);
 			if (!judged) return undefined;
-			// PASS / UNCERTAIN settle; only a FAIL blocks. Settle SILENTLY: surfacing the
-			// verdict via pi.sendMessage re-enters the conversation (even with triggerTurn:false),
-			// so the agent takes a turn on it, re-stops, and this holistic review re-runs —
-			// looping the Stop on every PASS up to the harness continuation cap. Use a
-			// non-conversation UI notice and return undefined so the stop actually settles.
 			const decision = stopReviewDecision(judged.verdict, judged.scorecard);
 			if (!decision) {
 				notifyUI(ctx, `Reflector Stop Review ${judged.verdict}.`, "info");

@@ -1,6 +1,6 @@
 {
   "name": "codex-reflector",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Reflector: decision-model scorecards for writes, plans, and stops, with an opt-in bash guard on oh-my-pi",
   "author": {
     "name": "cognitive-glitch"

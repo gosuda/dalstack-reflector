@@ -144,7 +144,7 @@ Run the unit tests with `bun test omp/codex-reflector.test.ts`.
 
 | omp event | Trigger | Mode | Purpose |
 |---|---|---|---|
-| `tool_result` | `write` / `edit` / `ast_edit`, Fast-Apply MCP edit | async | Decision-model scorecard review (PASS/FAIL/UNCERTAIN) |
+| `tool_result` | `write` / `edit` / `ast_edit` / `fast_edit`, Fast-Apply MCP edit | async | Decision-model scorecard review (PASS/FAIL/UNCERTAIN) |
 | `tool_call` | `bash`, before execution | sync | Opt-in bash guard; five yes/no answers; blocks at 0.9 |
 | `session_stop` | main agent about to settle | sync | Fresh judge review once per stop chain (`stop_hook_active` guard); only FAIL blocks (PASS/UNCERTAIN settle); native 8-continuation cap backstop |
 
@@ -159,7 +159,7 @@ Both surfaces read `CODEX_REFLECTOR_ENABLED` and `CODEX_REFLECTOR_DEBUG`. The `T
 | `CODEX_REFLECTOR_ENABLED` | `1` | Set to `0` to disable all hooks (both surfaces) |
 | `CODEX_REFLECTOR_BASH_GUARD` | `0` | OMP only. Set to `1` to enable the opt-in pre-execution bash guard (`0` disables). Python has no bash guard |
 | `CODEX_REFLECTOR_STOP_REVIEW` | `0` (OMP) | OMP only. Set to `1` to enable the opt-in Stop gate (`0` disables). The Python Stop gate is always on |
-| `CODEX_REFLECTOR_DEBUG` | `0` | Set to `1` for stderr diagnostics (both surfaces) |
+| `CODEX_REFLECTOR_DEBUG` | `0` | Set to `1` for diagnostics: on stderr in the Python plugin, in the agent log on oh-my-pi |
 | `TYPESAFE_API_KEY` | _(none)_ | Python only. Required. Bearer token for the TypeSafe decision-model API |
 | `TYPESAFE_BASE_URL` | `https://api.typesafe.ai` | Python only. Judge API base URL |
 | `TYPESAFE_DEFAULT_MODEL` | `jev-1.14.0` | Python only. Judge model id |
@@ -187,7 +187,7 @@ The verdict is computed in code from the judge's probabilities:
 - PASS when the worst defect probability is below 0.3 and no concern is strictly the most likely level on every dimension that still applies.
 - UNCERTAIN otherwise. A dimension that leans to a concrete concern makes the verdict UNCERTAIN, so the agent sees it.
 
-Only a FAIL blocks, and only at the Stop gate and the bash guard. Write and plan reviews are advisory. Both surfaces judge the text of the last assistant message at the Stop gate, and fall back to the transcript only when that message has no text. The Stop gate runs once per stop chain and blocks when the worst defect probability reaches 0.9: in the Python plugin a FAIL blocks via exit `2`, then the `stop_hook_active` guard lets a re-stop settle; in omp a FAIL returns `{ decision: "block", reason }` and the same guard settles the re-stop, with the native 8-continuation cap as backstop.
+Only the Stop gate and the bash guard can block. The Stop gate blocks on a FAIL, and the bash guard blocks when an answer reaches 0.9. Write and plan reviews are advisory. Both surfaces judge the text of the last assistant message at the Stop gate, and fall back to the transcript only when that message has no text. The Stop gate runs once per stop chain and blocks when the worst defect probability reaches 0.9: in the Python plugin a FAIL blocks via exit `2`, then the `stop_hook_active` guard lets a re-stop settle; in omp a FAIL returns `{ decision: "block", reason }` and the same guard settles the re-stop, with the native 8-continuation cap as backstop.
 
 If the message and the transcript are both empty, the Stop gate settles without a review and without a notice.
 

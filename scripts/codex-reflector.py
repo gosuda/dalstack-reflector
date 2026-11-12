@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""Reflector: decision-model review for Claude Code and Cursor hooks.
-
-Routes Claude Code hook events: verdict routes (write review, plan review,
-Stop gate) to the TypeSafe System One decision model, which is the only
-reviewer. Reads hook JSON from stdin, returns structured JSON on stdout.
-
-Env vars:
-  CODEX_REFLECTOR_ENABLED  - "0" to disable (default "1")
-  CODEX_REFLECTOR_DEBUG    - "1" for stderr diagnostics
-  TYPESAFE_API_KEY         - bearer credential for the decision model
-  TYPESAFE_BASE_URL        - decision-model endpoint (https, or http on loopback)
-  TYPESAFE_DEFAULT_MODEL   - decision model id (default jev-1.14.0)
-"""
 
 from __future__ import annotations
 
@@ -35,14 +22,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
 DEBUG = os.environ.get("CODEX_REFLECTOR_DEBUG", "0") == "1"
-_SYNTHETIC_PREFIX = (
-    "synthetic::"  # Readability convention for non-filesystem path identifiers
-)
+_SYNTHETIC_PREFIX = "synthetic::"
 
 
 def debug(msg: str) -> None:
@@ -50,15 +31,11 @@ def debug(msg: str) -> None:
         print(f"[codex-reflector] {msg}", file=sys.stderr)
 
 
-# ---------------------------------------------------------------------------
-# Security hardening
-# ---------------------------------------------------------------------------
-
 _SECRET_PATTERNS = [
     re.compile(r"(?i)(api[_-]?key|secret|token|password|credential|auth)\s*[=:]\s*\S+"),
     re.compile(r"(?i)bearer\s+\S+"),
     re.compile(r"(?:ghp|gho|ghs|ghu|github_pat)_[A-Za-z0-9_]{16,}"),
-    re.compile(r"sk-[A-Za-z0-9]{20,}"),  # OpenAI-style keys
+    re.compile(r"sk-[A-Za-z0-9]{20,}"),
     re.compile(r"-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----[\s\S]*?-----END"),
     re.compile(r"(?i)(aws_access_key_id|aws_secret_access_key)\s*=\s*\S+"),
 ]
@@ -69,10 +46,6 @@ def _redact(text: str) -> str:
         text = pat.sub("[REDACTED]", text)
     return text
 
-
-# ---------------------------------------------------------------------------
-# Decision-model judge — TypeSafe System One
-# ---------------------------------------------------------------------------
 
 FAIL_AT_ADVISORY = 0.7
 PASS_BELOW = 0.3
@@ -564,8 +537,6 @@ def render_scorecard(
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    # SAFETY: returning None makes urllib raise for the redirect itself, so the
-    # bearer credential never reaches another host.
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
@@ -883,10 +854,6 @@ def invoke_judge(
     questions: dict[str, Question],
     review: _Review | None = None,
 ) -> tuple[dict[str, Answer] | None, str]:
-    """Ask the decision model; return (answers, model) or (None, cause).
-
-    Never raises, so every verdict route can fail open with one skip notice.
-    """
     key = os.environ.get("TYPESAFE_API_KEY", "")
     if not key:
         return None, "TYPESAFE_API_KEY is not set"
@@ -964,11 +931,6 @@ def judge_review(
     return verdict, render_scorecard(route, results, completeness_judged)
 
 
-# ---------------------------------------------------------------------------
-# Tool classification — routing tables + model selection
-# ---------------------------------------------------------------------------
-
-# Exact-match routing: tool_name → category
 _TOOL_ROUTES: dict[str, str] = {
     "Write": "code_change",
     "Edit": "code_change",
@@ -978,8 +940,7 @@ _TOOL_ROUTES: dict[str, str] = {
     "ExitPlanMode": "plan_review",
 }
 
-# Tools that never need review — fast exit
-_SKIP_TOOLS: frozenset[str] = frozenset(
+_NEVER_REVIEWED_TOOLS: frozenset[str] = frozenset(
     {
         "Read",
         "Glob",
@@ -1000,28 +961,14 @@ _SKIP_TOOLS: frozenset[str] = frozenset(
     }
 )
 
-# MCP substrings for code-editing tools. Explicit edit-function marker only:
-# bare Morph server markers would route non-edit Morph tools (fastcompact,
-# warpgrep) into code-change review.
 _MCP_EDIT_MARKERS: tuple[str, ...] = ("__edit_file",)
 
 
 def _is_fast_apply(tool_name: str) -> bool:
-    """Detect Fast Apply (Morph etc.) — `mcp__*__edit_file` shape.
-
-    Name-only check; callers that need to confirm Morph payload semantics must
-    additionally verify `tool_input.code_edit` and `tool_input.instruction`
-    are present. See `_fast_apply_text` for the shape-confirming check.
-    """
     return tool_name.startswith("mcp__") and "__edit_file" in tool_name
 
 
 def _is_safe_edit_path(path_str: str, cwd: str) -> bool:
-    """Allow Fast Apply post-edit disk read only under cwd or ~/.claude/plans.
-
-    Resolves relative paths against the hook-supplied `cwd`, not the reflector
-    process cwd. Returns False on any resolve error.
-    """
     if not path_str or not cwd:
         return False
     try:
@@ -1043,11 +990,9 @@ def _is_safe_edit_path(path_str: str, cwd: str) -> bool:
 
 
 def classify(tool_name: str) -> str | None:
-    """Route tool call → category ("code_change", "plan_review") or None to skip."""
-    # Exact match → category → MCP fallback → skip
     cat = _TOOL_ROUTES.get(tool_name)
     if cat is None:
-        if tool_name in _SKIP_TOOLS:
+        if tool_name in _NEVER_REVIEWED_TOOLS:
             return None
         if tool_name.startswith("mcp__"):
             if any(m in tool_name for m in _MCP_EDIT_MARKERS):
@@ -1059,29 +1004,21 @@ def classify(tool_name: str) -> str | None:
     return cat
 
 
-# ---------------------------------------------------------------------------
-# Plan discovery
-# ---------------------------------------------------------------------------
+_GLOBAL_PLANS_DIR = Path.home() / ".claude" / "plans"
 
-# Global plans directory — plans live in ~/.claude/plans/, NOT <project>/.claude/plans/
-_PLANS_DIR = Path.home() / ".claude" / "plans"
-
-# Fallback regex for extracting plan path from tool_response string
-_PLAN_SAVED_RE = re.compile(r"saved to:\s*(/[^\n\"]+\.md)")
+_PLAN_SAVED_TEXT_RE = re.compile(r"saved to:\s*(/[^\n\"]+\.md)")
 
 
 def _is_synthetic_path(path: str) -> bool:
-    """Check if a plan path is a synthetic (non-filesystem) identifier."""
     return path.startswith(_SYNTHETIC_PREFIX)
 
 
 def _validate_plan_path(path_str: str) -> str | None:
-    """Validate that a plan path is confined to ~/.claude/plans/ and is .md."""
     if _is_synthetic_path(path_str):
         return None
     try:
         resolved = Path(path_str).resolve()
-        plans_resolved = _PLANS_DIR.resolve()
+        plans_resolved = _GLOBAL_PLANS_DIR.resolve()
     except (OSError, ValueError):
         return None
     if resolved.suffix != ".md":
@@ -1094,15 +1031,9 @@ def _validate_plan_path(path_str: str) -> str | None:
 
 
 def _extract_plan_path(tool_response: dict[str, object] | str | None) -> str | None:
-    """Extract plan file path from ExitPlanMode tool_response.
-
-    Handles dict (with filePath key) and string (with "saved to:" text).
-    Returns a validated absolute path confined to ~/.claude/plans/, or None.
-    """
     if not tool_response:
         return None
 
-    # Dict with filePath key (expected common case)
     if isinstance(tool_response, dict):
         fp = tool_response.get("filePath")
         if isinstance(fp, str) and fp:
@@ -1110,11 +1041,10 @@ def _extract_plan_path(tool_response: dict[str, object] | str | None) -> str | N
             if validated:
                 debug(f"plan path from tool_response.filePath: {validated}")
                 return validated
-        # Dict without filePath — try string content values
         for key in ("content", "result", "text"):
             val = tool_response.get(key)
             if isinstance(val, str):
-                m = _PLAN_SAVED_RE.search(val)
+                m = _PLAN_SAVED_TEXT_RE.search(val)
                 if m:
                     validated = _validate_plan_path(m.group(1).strip())
                     if validated:
@@ -1122,9 +1052,8 @@ def _extract_plan_path(tool_response: dict[str, object] | str | None) -> str | N
                         return validated
         return None
 
-    # String tool_response (fallback)
     if isinstance(tool_response, str):
-        m = _PLAN_SAVED_RE.search(tool_response)
+        m = _PLAN_SAVED_TEXT_RE.search(tool_response)
         if m:
             validated = _validate_plan_path(m.group(1).strip())
             if validated:
@@ -1135,24 +1064,13 @@ def _extract_plan_path(tool_response: dict[str, object] | str | None) -> str | N
 
 
 def _find_plan_for_session(hook_data: dict[str, object]) -> tuple[str, str] | None:
-    """Deterministic plan discovery from PostToolUse hook data.
-
-    Resolution order:
-      1. tool_response.filePath → direct path (zero I/O best case)
-      2. Content from tool_response.plan or tool_input.plan
-      3. If path found but no content → read from disk
-      4. If content found but no path → synthetic session-keyed path
-      5. Last resort → global ~/.claude/plans/ mtime scan
-    """
     tool_response = hook_data.get("tool_response")
     if not isinstance(tool_response, (dict, str)):
         tool_response = None
     tool_input = hook_data.get("tool_input", {})
 
-    # Extract path from tool_response
     plan_path = _extract_plan_path(tool_response)
 
-    # Gather content from hook data (avoid disk I/O)
     plan_content = ""
     if isinstance(tool_response, dict):
         plan_content = tool_response.get("plan", "")
@@ -1163,7 +1081,6 @@ def _find_plan_for_session(hook_data: dict[str, object]) -> tuple[str, str] | No
         if plan_content:
             debug("plan from tool_response path + hook content (zero I/O)")
             return (plan_path, plan_content)
-        # Path found but no content in hook data — read from disk
         if _is_synthetic_path(plan_path):
             raise ValueError(f"synthetic path reached I/O boundary: {plan_path}")
         try:
@@ -1174,23 +1091,20 @@ def _find_plan_for_session(hook_data: dict[str, object]) -> tuple[str, str] | No
             debug(f"cannot read plan at {plan_path}: {exc}")
 
     if plan_content:
-        # Content but no path — use synthetic session-keyed path
         session_id = hook_data.get("session_id", "unknown")
         synthetic = f"{_SYNTHETIC_PREFIX}plan:session:{session_id}"
         debug(f"plan from hook content with synthetic path: {synthetic}")
         return (synthetic, plan_content)
 
-    # Last resort: global mtime fallback
     debug("falling back to global mtime plan discovery")
     return _find_latest_plan_global()
 
 
 def _find_latest_plan_global() -> tuple[str, str] | None:
-    """Find the most recently modified plan in ~/.claude/plans/ (mtime fallback)."""
-    if not _PLANS_DIR.is_dir():
+    if not _GLOBAL_PLANS_DIR.is_dir():
         debug("no ~/.claude/plans/ directory")
         return None
-    candidates = list(_PLANS_DIR.glob("*.md"))
+    candidates = list(_GLOBAL_PLANS_DIR.glob("*.md"))
     if not candidates:
         debug("no plan files found in ~/.claude/plans/")
         return None
@@ -1204,17 +1118,11 @@ def _find_latest_plan_global() -> tuple[str, str] | None:
         return None
 
 
-# Verdict → display prefix (shared by the verdict responders)
 _VERDICT_PREFIX: dict[str, str] = {
     "FAIL": "\u26a0\ufe0f FAIL",
     "PASS": "\u2713 PASS",
     "UNCERTAIN": "? UNCERTAIN",
 }
-
-
-# ---------------------------------------------------------------------------
-# Response builders
-# ---------------------------------------------------------------------------
 
 
 def _fast_apply_text(
@@ -1355,7 +1263,6 @@ _CURSOR_EVENT_MAP = {
 
 
 def _normalize_cursor_input(hook_data: dict[str, object]) -> dict[str, object]:
-    """Map Cursor-shaped hook payloads into the Claude-shaped fields we route on."""
     event = hook_data.get("hook_event_name")
     if isinstance(event, str) and event in _CURSOR_EVENT_MAP:
         hook_data["hook_event_name"] = _CURSOR_EVENT_MAP[event]
@@ -1390,11 +1297,6 @@ def _normalize_cursor_input(hook_data: dict[str, object]) -> dict[str, object]:
             hook_data["stop_hook_active"] = False
 
     return hook_data
-
-
-# ---------------------------------------------------------------------------
-# Self-test mode
-# ---------------------------------------------------------------------------
 
 
 def _restore_env(name: str, value: str | None) -> None:
@@ -1551,15 +1453,6 @@ def _recorded_judge_server(judge: _RecordedJudgeServer):
 
 
 class _RecordedJudgeServer:
-    """Loopback stand-in for the System One endpoint.
-
-    Every request is validated against the published System One schema before
-    the scripted responder runs; a violation answers HTTP 422 with a JSON
-    error body and the responder never runs. `responder(record)` scripts each
-    reply as (status, payload bytes, extra headers); every request lands in
-    `records` with lower-cased headers and its zero-based request `index`.
-    """
-
     def __init__(
         self,
         responder: Callable[
@@ -1601,9 +1494,6 @@ class _RecordedJudgeServer:
 
 
 class _ShortReply:
-    """Reply whose declared Content-Length exceeds the bytes sent, so the
-    client read ends in http.client.IncompleteRead."""
-
     def __init__(self, payload: bytes) -> None:
         self.payload = payload
         self.declared = len(payload) + 16
@@ -1648,13 +1538,6 @@ def _answers_reply(overrides: dict[str, float | dict[str, float]], model: str) -
 def _scripted_replies(
     script: list[_JudgeReply],
 ) -> Callable[[_JudgeRequestRecord], tuple[int, bytes | _ShortReply, dict[str, str]]]:
-    """Responder replaying (status, payload, headers) rows in request order.
-
-    The last row repeats with its payload source re-run, so a client retry
-    exhausts the table into the final reply. A payload source is bytes, a
-    `_ShortReply`, or a callable receiving the request record.
-    """
-
     def responder(
         record: _JudgeRequestRecord,
     ) -> tuple[int, bytes | _ShortReply, dict[str, str]]:
@@ -3659,7 +3542,6 @@ def _selftest_safe_edit_paths(check: Callable[[str, object], None]) -> None:
 
 
 def run_self_test() -> None:
-    """Self-test: python3 scripts/codex-reflector.py --test-parse"""
     results: list[bool] = []
 
     def check(desc: str, ok: object) -> None:
@@ -3711,25 +3593,18 @@ def run_self_test() -> None:
     sys.exit(0 if passed == total else 1)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
 def main() -> None:
     if "--test-parse" in sys.argv:
         run_self_test()
         return
 
-    # Kill switch
     if os.environ.get("CODEX_REFLECTOR_ENABLED", "1") == "0":
         sys.exit(0)
 
-    # Read hook JSON from stdin
     try:
         hook_data = json.loads(sys.stdin.read())
     except (json.JSONDecodeError, OSError):
-        sys.exit(0)  # fail-open
+        sys.exit(0)
 
     hook_data = _normalize_cursor_input(hook_data)
 
@@ -3742,7 +3617,6 @@ def main() -> None:
 
     debug(f"event={event} tool={hook_data.get('tool_name', 'N/A')}")
 
-    # Route by event
     result: dict[str, object] | None = None
 
     if event == "Stop":
@@ -3775,19 +3649,16 @@ def main() -> None:
         debug(f"unhandled event: {event}")
         sys.exit(0)
 
-    # Output: exit 0 = JSON to stdout, exit 2 = blocking (stderr fed to Claude)
     if result:
         exit_code = result.get("_exit", 2 if result.get("decision") == "block" else 0)
         if not isinstance(exit_code, int):
             exit_code = 0
         payload = {k: v for k, v in result.items() if k != "_exit"}
         if exit_code >= 2:
-            # Exit 2: stderr text fed to Claude as context
             print(
                 payload.get("reason", payload.get("systemMessage", "")), file=sys.stderr
             )
             sys.exit(exit_code)
-        # Exit 0: JSON to stdout — systemMessage + hookSpecificOutput processed
         print(json.dumps(payload))
     sys.exit(0)
 
