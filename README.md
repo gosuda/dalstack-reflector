@@ -187,7 +187,9 @@ The verdict is computed in code from the judge's probabilities:
 - PASS when the worst defect probability is below 0.3 and no concern is strictly the most likely level on every dimension that still applies.
 - UNCERTAIN otherwise. A dimension that leans to a concrete concern makes the verdict UNCERTAIN, so the agent sees it.
 
-Only a FAIL blocks, and only at the Stop gate and the bash guard. Write and plan reviews are advisory. The Stop gate runs once per stop chain and blocks when the worst defect probability reaches 0.9: in the Python plugin a FAIL blocks via exit `2`, then the `stop_hook_active` guard lets a re-stop settle; in omp a FAIL returns `{ decision: "block", reason }` and the same guard settles the re-stop, with the native 8-continuation cap as backstop.
+Only a FAIL blocks, and only at the Stop gate and the bash guard. Write and plan reviews are advisory. Both surfaces judge the text of the last assistant message at the Stop gate, and fall back to the transcript only when that message has no text. The Stop gate runs once per stop chain and blocks when the worst defect probability reaches 0.9: in the Python plugin a FAIL blocks via exit `2`, then the `stop_hook_active` guard lets a re-stop settle; in omp a FAIL returns `{ decision: "block", reason }` and the same guard settles the re-stop, with the native 8-continuation cap as backstop.
+
+If the message and the transcript are both empty, the Stop gate settles without a review and without a notice.
 
 ## The Scorecard
 
@@ -202,6 +204,16 @@ Judged by jev-1.14.0.
 
 When no dimension shows a concern, the body reads `No dimension shows a material defect (highest P(defect)=0.04).`
 
+### Parts
+
+A change, a plan, a stop subject, or a command can be over 28,000 bytes after secrets are redacted. The reflector does not cut it. It splits the text into consecutive parts and judges every part with the same questions.
+
+The combined verdict is FAIL when any judged part is FAIL. When every part has a verdict, it is PASS when all parts are PASS, and UNCERTAIN otherwise. When a part shows a concern, its scorecard line ends with the part it came from, for example ` (part 3 of 9)`.
+
+Completeness is judged only when the whole subject and the request fit in one part. When the subject alone had to be split, the scorecard holds the line `Completeness was not judged: the subject was split into <n> parts.` When the subject is one part but the request does not fit with it, the line reads `Completeness was not judged: the request does not fit in one part with the subject.`
+
+A FAIL from a judged part stands even when other parts were not judged. The scorecard then holds the line `Parts not judged: <k> of <n> (<cause>).` Without a FAIL, one part without a verdict skips the review with the `review skipped: <cause>` notice.
+
 The thresholds are fixed in code: FAIL at 0.7 on the advisory routes (write review, plan review), PASS below 0.3, block at 0.9 (Stop gate, bash guard).
 
 ## Limits
@@ -213,6 +225,14 @@ The decision model reads text. Text inside the change it judges can steer it. Tr
 Layout, animation, and accessibility are judged from the source text of UI files. The judge never sees a rendered page.
 
 The reflector does not explain a failed command and does not reflect on thinking steps.
+
+A subject over 28,000 bytes is split into parts, and each part gets one judge call. At most 8 calls run at a time. On oh-my-pi all calls must end inside the 25 second handler budget; in the Python plugin inside 90 seconds. Otherwise the review is skipped with the notice.
+
+The 28,000 byte limit is a size estimate, not a guarantee. Text made mostly of rare characters can be over the context of the judge and be rejected. On oh-my-pi the `judge` role can be a model with a smaller context. A rejected part counts as a failed part; the Python plugin shows `judge request failed: HTTP 400`.
+
+A part is judged without the text around it. A defect that spans two parts can be missed.
+
+The Stop gate does not see your request, only the last answer of the agent.
 
 ## Safety
 

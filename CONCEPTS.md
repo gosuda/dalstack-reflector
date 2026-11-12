@@ -15,11 +15,17 @@ One yes/no question on the write route that adjusts the dimension set: executabl
 ### Defect probability
 The probability the judge assigns to the material-defect level of a dimension. The verdict rule compares the worst defect probability against the route threshold.
 
+### Part
+One consecutive piece of an oversized subject, at most 28,000 UTF-8 bytes. A piece is cut after the last newline that lies in its second half. The code calls it a chunk. A subject in one part gives the same scorecard as before parts existed.
+
+### Combined verdict
+The verdict over the parts of a split subject. Per part the verdict rule applies unchanged. The combined verdict is FAIL when any judged part is FAIL. When every part has a verdict, it is PASS when all parts are PASS, and UNCERTAIN otherwise. A FAIL stands when other parts have no verdict.
+
 ### Scorecard
-The review text a route emits: the verdict prefix, one line per dimension that shows a concern, and the judge model id.
+The review text a route emits: the verdict prefix, one line per dimension that shows a concern, and the judge model id. With more than one part, each dimension keeps the line with the highest defect probability, the earliest part on a tie, and that line ends with the part it came from, ` (part <i> of <n>)`. The model line names each distinct judge model once, in part order, joined by `, `. A split subject adds one of two completeness lines, `Completeness was not judged: the subject was split into <n> parts.` or `Completeness was not judged: the request does not fit in one part with the subject.`, and a review with unjudged parts adds `Parts not judged: <k> of <n> (<cause>).`.
 
 ### Judge unavailable
-Any failure to get judge answers: no credential, HTTP error, timeout, abort, malformed answer, or a missing question id. The route proceeds unreviewed and emits one notice, `review skipped: <cause>`.
+Any failure to get judge answers: no credential, HTTP error, timeout, abort, malformed answer, or a missing question id. The route proceeds unreviewed and emits one notice, `review skipped: <cause>`. On a split subject, a FAIL from a judged part stands even when other parts have no verdict; the scorecard then holds the `Parts not judged` line. Without a FAIL, one part without a verdict skips the whole review with the notice.
 
 ## Review surfaces
 
@@ -30,7 +36,7 @@ The Python plugin that receives Claude Code (and Cursor-adapted) hook events, as
 The native oh-my-pi extension that registers the same review idea as hook handlers. It asks the omp judge (`modelRoles.judge`) for verdicts on write review, Stop, and the bash guard. Per-tool reviews are advisory; the Stop gate and the bash guard may block.
 
 ### Stop gate
-Also called the holistic Stop review. The single blocking review run once per stop chain, answered by the decision model. It blocks when the worst defect probability reaches 0.9. PASS and UNCERTAIN settle fail-open. Re-stops with the harness stop-active flag settle without re-reviewing.
+Also called the holistic Stop review. The single blocking review run once per stop chain, answered by the decision model. Its subject is the text of the last assistant message, with the transcript as fallback only when that message has no text. It blocks when the worst defect probability reaches 0.9. PASS and UNCERTAIN settle fail-open. Re-stops with the harness stop-active flag settle without re-reviewing.
 
 ## Flagged ambiguities
 

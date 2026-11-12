@@ -15,22 +15,25 @@ Env vars:
 
 from __future__ import annotations
 
+import concurrent.futures
+import functools
 import http.client
 import ipaddress
 import json
-import math
 import os
+import random
 import re
 import socket
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -67,22 +70,6 @@ def _redact(text: str) -> str:
     return text
 
 
-def _read_tail(path: str, max_bytes: int = 20_000) -> str:
-    """Read last max_bytes of a file without loading the whole thing."""
-    if not path:
-        return ""
-    try:
-        size = os.path.getsize(path)
-        with open(path, "r", errors="replace") as f:
-            if size > max_bytes:
-                f.seek(size - max_bytes)
-                # Skip partial first line to avoid splitting a line in the middle
-                f.readline()  # skip partial first line (standard tail — incomplete line at seek boundary)
-            return f.read()
-    except OSError:
-        return ""
-
-
 # ---------------------------------------------------------------------------
 # Decision-model judge — TypeSafe System One
 # ---------------------------------------------------------------------------
@@ -90,10 +77,8 @@ def _read_tail(path: str, max_bytes: int = 20_000) -> str:
 FAIL_AT_ADVISORY = 0.7
 PASS_BELOW = 0.3
 BLOCK_AT = 0.9
-STATE_MAX_CHARS = 60000
+CHUNK_MAX_BYTES = 28000
 
-_STATE_HEAD_CHARS = 30000
-_STATE_TAIL_CHARS = 30000
 _MATERIAL_DEFECT_AT = 0.5
 
 _JUDGE_DEFAULT_MODEL = "jev-1.14.0"
@@ -101,6 +86,9 @@ _JUDGE_TIMEOUT_SECS = 10.0
 _JUDGE_MAX_ATTEMPTS = 3
 _JUDGE_BACKOFF_CAP_SECS = 5.0
 _JUDGE_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+_JUDGE_MAX_IN_FLIGHT = 8
+_JUDGE_REVIEW_DEADLINE_SECS = 90.0
+_JUDGE_RANDOM = random.random
 
 _ROUTE_SUBJECTS = {
     "write": "code change",
@@ -327,21 +315,23 @@ _SCREENS: tuple[_ScreenSpec, ...] = (
 )
 
 
-def _fit_state(text: str, limit: int = STATE_MAX_CHARS) -> str:
-    if len(text) <= limit:
-        return text
-    omitted = len(text) - _STATE_HEAD_CHARS - _STATE_TAIL_CHARS
-    return (
-        text[:_STATE_HEAD_CHARS]
-        + f"\n…[{omitted} chars omitted]…\n"
-        + text[-_STATE_TAIL_CHARS:]
-    )
-
-
-def _state_text(text: str) -> str:
-    # SAFETY: redaction must precede truncation so a secret cannot survive in
-    # the kept head or tail half of a fitted state value.
-    return _fit_state(_redact(text))
+def _chunk_text(text: str, limit: int = CHUNK_MAX_BYTES) -> list[str]:
+    if limit < 4:
+        raise ValueError(f"chunk limit must be at least 4, got {limit}")
+    data = text.encode("utf-8", "surrogatepass")
+    chunks: list[str] = []
+    pos = 0
+    while len(data) - pos > limit:
+        end = pos + limit
+        while data[end] & 0xC0 == 0x80:
+            end -= 1
+        newline = data.rfind(b"\n", pos, end)
+        if newline - pos >= 0 and 2 * (newline - pos) >= end - pos:
+            end = newline + 1
+        chunks.append(data[pos:end].decode("utf-8", "surrogatepass"))
+        pos = end
+    chunks.append(data[pos:].decode("utf-8", "surrogatepass"))
+    return chunks
 
 
 class _ScreenQuestion(TypedDict):
@@ -356,13 +346,25 @@ class _ScoreQuestion(TypedDict):
     criteria: list[str]
 
 
+class _JudgedChunk(TypedDict):
+    answers: dict[str, Answer]
+    model: str
+
+
+class _SkippedChunk(TypedDict):
+    cause: str
+
+
 if TYPE_CHECKING:
     from typing import Self
 
     Question = _ScreenQuestion | _ScoreQuestion
+    _ChunkResult = _JudgedChunk | _SkippedChunk
 
 
-def build_questions(route: str, file_path: str = "") -> dict[str, Question]:
+def build_questions(
+    route: str, file_path: str = "", completeness_judged: bool = True
+) -> dict[str, Question]:
     subject = _ROUTE_SUBJECTS[route]
     if route == "write":
         screens = _SCREENS
@@ -374,6 +376,8 @@ def build_questions(route: str, file_path: str = "") -> dict[str, Question]:
     else:
         screens = ()
         dimensions = _DIMENSIONS
+    if not completeness_judged:
+        dimensions = tuple(d for d in dimensions if d["id"] != "spec_completion")
     questions: dict[str, Question] = {}
     for screen in screens:
         questions[screen["id"]] = _ScreenQuestion(
@@ -408,7 +412,7 @@ def _scored_dimensions(
             defects[dimension["id"]] = answer["probabilities"]["0"]
     if route == "write":
         placeholder = answers["has_placeholder"]
-        if placeholder["type"] == "noul":
+        if placeholder["type"] == "noul" and "spec_completion" in defects:
             defects["spec_completion"] = max(
                 defects["spec_completion"], placeholder["noul"]
             )
@@ -432,38 +436,130 @@ def derive_verdict(route: str, answers: dict[str, Answer]) -> str:
     return "PASS"
 
 
-def render_scorecard(
-    route: str, answers: dict[str, Answer], model: str
-) -> str:
-    dimensions, defects = _scored_dimensions(route, answers)
-    ranked = sorted(dimensions, key=lambda d: defects[d["id"]], reverse=True)
-    lines: list[str] = []
-    for dimension in ranked:
-        defect = defects[dimension["id"]]
-        answer = answers[dimension["id"]]
-        if answer["type"] != "score":
+def combine_verdicts(
+    verdicts: list[str | None],
+) -> str | None:
+    judged = [verdict for verdict in verdicts if verdict is not None]
+    if "FAIL" in judged:
+        return "FAIL"
+    if len(judged) < len(verdicts):
+        return None
+    return "PASS" if all(verdict == "PASS" for verdict in judged) else "UNCERTAIN"
+
+
+def _dimension_line(
+    dimension: _DimensionSpec, answers: dict[str, Answer], defect: float
+) -> str | None:
+    answer = answers[dimension["id"]]
+    if answer["type"] != "score":
+        return None
+    levels = answer["probabilities"]
+    likely = 0
+    if levels["1"] > levels["0"]:
+        likely = 1
+    if levels["2"] > levels[str(likely)]:
+        likely = 2
+    if defect < PASS_BELOW and likely not in (0, 1):
+        return None
+    if defect >= _MATERIAL_DEFECT_AT:
+        shown = 0
+    elif defect >= PASS_BELOW:
+        shown = min(likely, 1)
+    else:
+        shown = likely
+    return (
+        f"- {dimension['id']}: {_LEVEL_NAMES[shown]} "
+        f"(P(defect)={defect:.2f}) {dimension['criteria'][shown]}"
+    )
+
+
+def _worst_line(
+    dimension: _DimensionSpec,
+    scored: list[tuple[int, dict[str, Answer], dict[str, float]]],
+) -> tuple[float, str, int] | None:
+    worst: tuple[float, str, int] | None = None
+    for index, answers, defects in scored:
+        defect = defects.get(dimension["id"])
+        if defect is None:
             continue
-        levels = answer["probabilities"]
-        likely = 0
-        if levels["1"] > levels[str(likely)]:
-            likely = 1
-        if levels["2"] > levels[str(likely)]:
-            likely = 2
-        if defect >= PASS_BELOW or likely in (0, 1):
-            shown = likely
-            if defect >= _MATERIAL_DEFECT_AT:
-                shown = 0
-            elif defect >= PASS_BELOW:
-                shown = min(shown, 1)
-            lines.append(
-                f"- {dimension['id']}: {_LEVEL_NAMES[shown]} "
-                f"(P(defect)={defect:.2f}) {dimension['criteria'][shown]}"
-            )
-    if not lines:
+        line = _dimension_line(dimension, answers, defect)
+        if line is not None and (worst is None or defect > worst[0]):
+            worst = (defect, line, index)
+    return worst
+
+
+def _judged_chunk(result: _ChunkResult) -> _JudgedChunk | None:
+    if "answers" in result:
+        return cast("_JudgedChunk", result)
+    return None
+
+
+def _chunk_cause(result: _ChunkResult) -> str | None:
+    if "cause" in result:
+        return cast("_SkippedChunk", result)["cause"]
+    return None
+
+
+def _dimension_lines(route: str, results: list[_ChunkResult]) -> list[str]:
+    parts = len(results)
+    scored: list[tuple[int, dict[str, Answer], dict[str, float]]] = []
+    for index, result in enumerate(results):
+        chunk = _judged_chunk(result)
+        if chunk is not None:
+            answers = chunk["answers"]
+            scored.append((index, answers, _scored_dimensions(route, answers)[1]))
+    ranked: list[tuple[float, str]] = []
+    for dimension in _DIMENSIONS + _UI_DIMENSIONS:
+        worst = _worst_line(dimension, scored)
+        if worst is None:
+            continue
+        suffix = f" (part {worst[2] + 1} of {parts})" if parts > 1 else ""
+        ranked.append((worst[0], worst[1] + suffix))
+    ranked.sort(key=lambda entry: -entry[0])
+    if ranked:
+        return [line for _, line in ranked]
+    highest = max(
+        (defect for _, _, defects in scored for defect in defects.values()),
+        default=0.0,
+    )
+    return [f"No dimension shows a material defect (highest P(defect)={highest:.2f})."]
+
+
+def _added_lines(
+    results: list[_ChunkResult], completeness_judged: bool
+) -> list[str]:
+    parts = len(results)
+    lines: list[str] = []
+    if not completeness_judged and parts > 1:
         lines.append(
-            f"No dimension shows a material defect (highest P(defect)={max(defects.values()):.2f})."
+            f"Completeness was not judged: the subject was split into {parts} parts."
         )
-    lines.append(f"Judged by {model}.")
+    elif not completeness_judged:
+        lines.append(
+            "Completeness was not judged: the request does not fit in one part with the subject."
+        )
+    causes = [cause for cause in map(_chunk_cause, results) if cause is not None]
+    if causes:
+        lines.append(f"Parts not judged: {len(causes)} of {parts} ({causes[0]}).")
+    return lines
+
+
+def _model_line(results: list[_ChunkResult]) -> str:
+    models: list[str] = []
+    for result in results:
+        chunk = _judged_chunk(result)
+        if chunk is not None and chunk["model"] not in models:
+            models.append(chunk["model"])
+    return f"Judged by {', '.join(models)}."
+
+
+def render_scorecard(
+    route: str,
+    results: list[_ChunkResult],
+    completeness_judged: bool,
+) -> str:
+    lines = _dimension_lines(route, results) + _added_lines(results, completeness_judged)
+    lines.append(_model_line(results))
     return "\n".join(lines)
 
 
@@ -474,12 +570,13 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _judge_opener(url: str) -> urllib.request.OpenerDirector:
+def _judge_opener(url: str, review: _Review) -> urllib.request.OpenerDirector:
+    tracked = (_ReviewHTTPHandler(review), _ReviewHTTPSHandler(review))
     if _is_loopback_host(urllib.parse.urlsplit(url).hostname):
         return urllib.request.build_opener(
-            urllib.request.ProxyHandler({}), _NoRedirect
+            urllib.request.ProxyHandler({}), _NoRedirect, *tracked
         )
-    return urllib.request.build_opener(_NoRedirect)
+    return urllib.request.build_opener(_NoRedirect, *tracked)
 
 
 def _is_loopback_host(host: str | None) -> bool:
@@ -526,17 +623,23 @@ def _judge_request(
     )
 
 
-def _retry_wait(attempt: int, headers) -> float:
-    wait = min(0.5 * (2 ** attempt), _JUDGE_BACKOFF_CAP_SECS)
+def _retry_after(headers) -> float | None:
     raw = headers.get("Retry-After") if headers is not None else None
-    if raw:
-        try:
-            after = float(raw)
-        except ValueError:
-            return wait
-        if 0 <= after < _JUDGE_BACKOFF_CAP_SECS:
-            wait = after
-    return wait
+    if not raw:
+        return None
+    try:
+        after = float(raw)
+    except ValueError:
+        return None
+    return after if 0 <= after < _JUDGE_BACKOFF_CAP_SECS else None
+
+
+def _retry_wait(attempt: int, headers, left: float) -> float:
+    wait = _retry_after(headers)
+    if wait is None:
+        nominal = min(0.5 * (2 ** attempt), _JUDGE_BACKOFF_CAP_SECS)
+        wait = nominal * (0.5 + 0.5 * _JUDGE_RANDOM())
+    return max(0.0, min(wait, left))
 
 
 class _NoulAnswer(TypedDict):
@@ -560,7 +663,7 @@ class _JudgeAnswerError(Exception):
 def _is_answer_number(value: object) -> bool:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
-    return math.isfinite(value) and 0.0 <= value <= 1.0
+    return 0 <= value <= 1
 
 
 def _answer_value(answer: object, wire_type: str) -> Answer:
@@ -599,8 +702,186 @@ def _judge_answers(
     return answers, model
 
 
+def _shut_socket(sock: socket.socket) -> None:
+    try:
+        socket.socket.shutdown(sock, socket.SHUT_RDWR)
+    except OSError as err:
+        debug(f"judge socket shutdown failed: {err}")
+
+
+class _Review:
+    def __init__(self) -> None:
+        self.clock: Callable[[], float] = time.monotonic
+        self.deadline = self.clock() + _JUDGE_REVIEW_DEADLINE_SECS
+        self.lock = threading.Lock()
+        self.refused: str | None = None
+        self.expired = False
+        self.sockets: set[socket.socket] = set()
+
+    def _past(self) -> bool:
+        return self.expired or self.clock() >= self.deadline
+
+    def left(self) -> float:
+        return max(0.0, self.deadline - self.clock())
+
+    def timed_out(self) -> bool:
+        with self.lock:
+            return self._past()
+
+    def admit(self) -> str | None:
+        with self.lock:
+            if self.refused is not None:
+                return self.refused
+            if self._past():
+                return "judge request timed out"
+            return None
+
+    def refuse(self, cause: str) -> None:
+        with self.lock:
+            if self.refused is None:
+                self.refused = cause
+
+    def track(self, sock: socket.socket) -> None:
+        with self.lock:
+            self.sockets.add(sock)
+            if self.expired:
+                _shut_socket(sock)
+
+    def expire(self) -> None:
+        with self.lock:
+            self.expired = True
+            for sock in self.sockets:
+                _shut_socket(sock)
+
+
+class _ReviewHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host: str, timeout: float, review: _Review) -> None:
+        super().__init__(host, timeout=timeout)
+        self.review = review
+
+    def connect(self) -> None:
+        super().connect()
+        self.review.track(self.sock)
+
+
+class _ReviewHTTPSConnection(_ReviewHTTPConnection, http.client.HTTPSConnection):
+    pass
+
+
+class _ReviewHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, review: _Review) -> None:
+        super().__init__()
+        self.review = review
+
+    def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        return self.do_open(
+            functools.partial(_ReviewHTTPConnection, review=self.review), req
+        )
+
+
+class _ReviewHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, review: _Review) -> None:
+        super().__init__()
+        self.review = review
+
+    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        return self.do_open(
+            functools.partial(_ReviewHTTPSConnection, review=self.review), req
+        )
+
+
+class _RetryableJudgeError(Exception):
+    def __init__(self, cause: str, headers=None) -> None:
+        super().__init__(cause)
+        self.cause = cause
+        self.headers = headers
+
+
+def _judge_body(
+    opener: urllib.request.OpenerDirector,
+    request: urllib.request.Request,
+    timeout: float,
+) -> bytes:
+    with opener.open(request, timeout=timeout) as response:
+        body = response.read(_JUDGE_MAX_RESPONSE_BYTES + 1)
+        if len(body) <= _JUDGE_MAX_RESPONSE_BYTES and response.length:
+            raise http.client.IncompleteRead(body, response.length)
+    if len(body) > _JUDGE_MAX_RESPONSE_BYTES:
+        raise _JudgeAnswerError("response exceeds the size limit")
+    return body
+
+
+def _network_cause(err: OSError | http.client.HTTPException) -> str:
+    reason = err.reason if isinstance(err, urllib.error.URLError) else err
+    if isinstance(reason, (socket.timeout, TimeoutError)):
+        return "judge request timed out"
+    return f"judge request failed: {type(reason).__name__}"
+
+
+def _attempt_failure(
+    err: OSError | http.client.HTTPException | ValueError | _JudgeAnswerError,
+    review: _Review,
+) -> tuple[None, str]:
+    if isinstance(err, _JudgeAnswerError):
+        return None, "judge answer was malformed"
+    if isinstance(err, urllib.error.HTTPError):
+        cause = f"judge request failed: HTTP {err.code}"
+        if err.code in (401, 403):
+            review.refuse(cause)
+        if err.code not in (408, 429) and err.code < 500:
+            return None, cause
+        raise _RetryableJudgeError(cause, err.headers) from err
+    if isinstance(err, ValueError):
+        return None, "judge request failed: ValueError"
+    raise _RetryableJudgeError(_network_cause(err)) from err
+
+
+def _judge_attempt(
+    opener: urllib.request.OpenerDirector,
+    request: urllib.request.Request,
+    questions: dict[str, Question],
+    review: _Review,
+) -> tuple[dict[str, Answer] | None, str]:
+    timeout = min(_JUDGE_TIMEOUT_SECS, review.left())
+    try:
+        body = _judge_body(opener, request, timeout)
+    except (OSError, http.client.HTTPException, ValueError, _JudgeAnswerError) as err:
+        if review.timed_out():
+            return None, "judge request timed out"
+        return _attempt_failure(err, review)
+    if review.timed_out():
+        return None, "judge request timed out"
+    try:
+        return _judge_answers(body, questions)
+    except _JudgeAnswerError:
+        return None, "judge answer was malformed"
+
+
+def _judge_attempts(
+    opener: urllib.request.OpenerDirector,
+    request: urllib.request.Request,
+    questions: dict[str, Question],
+    review: _Review,
+) -> tuple[dict[str, Answer] | None, str]:
+    cause = ""
+    for attempt in range(_JUDGE_MAX_ATTEMPTS):
+        refusal = review.admit()
+        if refusal is not None:
+            return None, refusal
+        try:
+            return _judge_attempt(opener, request, questions, review)
+        except _RetryableJudgeError as err:
+            cause = err.cause
+            wait = _retry_wait(attempt, err.headers, review.left())
+        if attempt + 1 < _JUDGE_MAX_ATTEMPTS:
+            time.sleep(wait)
+    return None, cause
+
+
 def invoke_judge(
-    state: dict[str, str], questions: dict[str, Question]
+    state: dict[str, str],
+    questions: dict[str, Question],
+    review: _Review | None = None,
 ) -> tuple[dict[str, Answer] | None, str]:
     """Ask the decision model; return (answers, model) or (None, cause).
 
@@ -615,45 +896,72 @@ def invoke_judge(
         debug(f"judge url refused: {err}")
         return None, f"judge request failed: {type(err).__name__}"
     request = _judge_request(url, key, state, questions)
-    opener = _judge_opener(url)
-    cause = "judge request failed"
-    for attempt in range(_JUDGE_MAX_ATTEMPTS):
-        try:
-            with opener.open(request, timeout=_JUDGE_TIMEOUT_SECS) as response:
-                body = response.read(_JUDGE_MAX_RESPONSE_BYTES + 1)
-                if len(body) <= _JUDGE_MAX_RESPONSE_BYTES and response.length:
-                    raise http.client.IncompleteRead(body, response.length)
-            if len(body) > _JUDGE_MAX_RESPONSE_BYTES:
-                return None, "judge answer was malformed"
-            return _judge_answers(body, questions)
-        except _JudgeAnswerError:
-            return None, "judge answer was malformed"
-        except ValueError:
-            return None, "judge request failed: ValueError"
-        except urllib.error.HTTPError as err:
-            cause = f"judge request failed: HTTP {err.code}"
-            if err.code not in (408, 429) and err.code < 500:
-                return None, cause
-            wait = _retry_wait(attempt, err.headers)
-        except (OSError, http.client.HTTPException) as err:
-            reason = err.reason if isinstance(err, urllib.error.URLError) else err
-            if isinstance(reason, (socket.timeout, TimeoutError)):
-                cause = "judge request timed out"
-            else:
-                cause = f"judge request failed: {type(reason).__name__}"
-            wait = _retry_wait(attempt, None)
-        if attempt + 1 < _JUDGE_MAX_ATTEMPTS:
-            time.sleep(wait)
-    return None, cause
+    review = review or _Review()
+    return _judge_attempts(_judge_opener(url, review), request, questions, review)
+
+
+def _chunk_states(state: dict[str, str]) -> tuple[list[dict[str, str]], bool]:
+    size = sum(
+        len(state[key].encode("utf-8", "surrogatepass"))
+        for key in ("subject", "request")
+        if key in state
+    )
+    completeness_judged = size <= CHUNK_MAX_BYTES
+    base = {
+        key: value
+        for key, value in state.items()
+        if completeness_judged or key != "request"
+    }
+    chunks = _chunk_text(state["subject"])
+    if len(chunks) == 1:
+        return [base], completeness_judged
+    states = [
+        {**base, "subject": chunk, "part": f"{index} of {len(chunks)}"}
+        for index, chunk in enumerate(chunks, 1)
+    ]
+    return states, completeness_judged
+
+
+def _judge_chunks(
+    states: list[dict[str, str]], questions: dict[str, Question]
+) -> list[_ChunkResult]:
+    review = _Review()
+    timer = threading.Timer(review.left(), review.expire)
+    timer.daemon = True
+    timer.start()
+    try:
+        workers = min(_JUDGE_MAX_IN_FLIGHT, len(states))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            replies = list(
+                pool.map(lambda state: invoke_judge(state, questions, review), states)
+            )
+    finally:
+        timer.cancel()
+    results: list[_ChunkResult] = []
+    for answers, model_or_cause in replies:
+        if answers is None:
+            results.append(_SkippedChunk(cause=model_or_cause))
+        else:
+            results.append(_JudgedChunk(answers=answers, model=model_or_cause))
+    return results
+
+
+def _chunk_verdict(route: str, result: _ChunkResult) -> str | None:
+    chunk = _judged_chunk(result)
+    return None if chunk is None else derive_verdict(route, chunk["answers"])
 
 
 def judge_review(
     route: str, state: dict[str, str], file_path: str = ""
 ) -> tuple[str | None, str]:
-    answers, model_or_cause = invoke_judge(state, build_questions(route, file_path))
-    if answers is None:
-        return None, f"codex-reflector: review skipped: {model_or_cause}"
-    return derive_verdict(route, answers), render_scorecard(route, answers, model_or_cause)
+    states, completeness_judged = _chunk_states(state)
+    questions = build_questions(route, file_path, completeness_judged)
+    results = _judge_chunks(states, questions)
+    verdict = combine_verdicts([_chunk_verdict(route, result) for result in results])
+    if verdict is None:
+        cause = next(cause for cause in map(_chunk_cause, results) if cause is not None)
+        return None, f"codex-reflector: review skipped: {cause}"
+    return verdict, render_scorecard(route, results, completeness_judged)
 
 
 # ---------------------------------------------------------------------------
@@ -919,7 +1227,7 @@ def _fast_apply_text(
     if not code_edit or not instruction or not _is_safe_edit_path(file_path, cwd):
         return None
     try:
-        applied = Path(file_path).read_text(encoding="utf-8", errors="replace")[:50_000]
+        applied = Path(file_path).read_text(encoding="utf-8", errors="replace")
     except (OSError, UnicodeDecodeError) as err:
         debug(f"fast-apply read failed: {err}")
         return None
@@ -951,10 +1259,10 @@ def _code_change_state(
     tool_name: str, tool_input: dict[str, object], cwd: str
 ) -> tuple[str, dict[str, str]]:
     file_path, change_text = _change_text(tool_name, tool_input, cwd)
-    state = {"file": _state_text(file_path), "subject": _state_text(change_text)}
+    state = {"file": _redact(file_path), "subject": _redact(change_text)}
     instruction = tool_input.get("instruction", "")
     if isinstance(instruction, str) and instruction:
-        state["request"] = _state_text(instruction)
+        state["request"] = _redact(instruction)
     return file_path, state
 
 
@@ -981,7 +1289,7 @@ def respond_code_review(
 def respond_plan_review(
     plan_path: str, plan_content: str, event_name: str = "PostToolUse"
 ) -> dict[str, object]:
-    state = {"subject": _state_text(plan_content)}
+    state = {"subject": _redact(plan_content)}
     verdict, body = judge_review("plan", state)
     if verdict is None:
         return {"systemMessage": body}
@@ -993,6 +1301,16 @@ def respond_plan_review(
             "additionalContext": f"Reflector Plan Review {prefix} [{plan_path}]:\n{body}",
         }
     return result
+
+
+def _read_transcript(path: str) -> str:
+    if not path:
+        return ""
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError as err:
+        debug(f"cannot read transcript: {err}")
+        return ""
 
 
 def respond_stop(hook_data: dict[str, object]) -> dict[str, object] | None:
@@ -1010,12 +1328,12 @@ def respond_stop(hook_data: dict[str, object]) -> dict[str, object] | None:
         transcript_path = hook_data.get("transcript_path", "")
         if not isinstance(transcript_path, str):
             transcript_path = ""
-        transcript = _read_tail(transcript_path, max_bytes=500_000)
+        transcript = _read_transcript(transcript_path)
     if not transcript:
         debug("no transcript available, approving stop")
         return None
 
-    state = {"subject": _state_text(transcript)}
+    state = {"subject": _redact(transcript)}
     verdict, body = judge_review("stop", state)
     if verdict is None:
         return {"systemMessage": body}
@@ -1149,23 +1467,29 @@ class _JudgeRequestRecord(TypedDict):
     headers: dict[str, str]
     body: bytes
     index: int
+    cancelled: threading.Event
 
 
 def _recorded_judge_server(judge: _RecordedJudgeServer):
     import http.server
 
     class JudgeRecorder(http.server.BaseHTTPRequestHandler):
-        def _captured_request(self) -> _JudgeRequestRecord:
+        def _record_request(self) -> _JudgeRequestRecord:
             length = int(self.headers.get("Content-Length", "0"))
-            return {
-                "method": self.command,
-                "path": self.path,
-                "headers": {
-                    name.lower(): value for name, value in self.headers.items()
-                },
-                "body": self.rfile.read(length),
-                "index": len(judge.records),
-            }
+            body = self.rfile.read(length)
+            with judge.lock:
+                record: _JudgeRequestRecord = {
+                    "method": self.command,
+                    "path": self.path,
+                    "headers": {
+                        name.lower(): value for name, value in self.headers.items()
+                    },
+                    "body": body,
+                    "index": len(judge.records),
+                    "cancelled": judge.cancelled,
+                }
+                judge.records.append(record)
+            return record
 
         def _send_reply(
             self,
@@ -1182,14 +1506,25 @@ def _recorded_judge_server(judge: _RecordedJudgeServer):
             for name, value in extra_headers.items():
                 self.send_header(name, str(value))
             self.end_headers()
-            try:
-                self.wfile.write(payload)
-            except (BrokenPipeError, ConnectionResetError) as err:
-                debug(f"judge test client dropped the reply: {err}")
+            self.wfile.write(payload)
+
+        def _trickle(self, reply: _TrickleReply) -> None:
+            self.wfile.write(reply[: reply.at])
+            for byte in reply[reply.at : reply.at + _TRICKLED_BYTES]:
+                if judge.cancelled.wait(0.2):
+                    return
+                self.wfile.write(bytes([byte]))
 
         def do_POST(self) -> None:
-            record = self._captured_request()
-            judge.records.append(record)
+            judge.enter()
+            try:
+                self._answer(self._record_request())
+            except (BrokenPipeError, ConnectionResetError) as err:
+                debug(f"judge test client dropped the reply: {err}")
+            finally:
+                judge.leave()
+
+        def _answer(self, record: _JudgeRequestRecord) -> None:
             violation = _schema_violation(record["body"])
             if violation is not None:
                 self._send_reply(
@@ -1197,6 +1532,9 @@ def _recorded_judge_server(judge: _RecordedJudgeServer):
                 )
                 return
             status, payload, extra_headers = judge.responder(record)
+            if isinstance(payload, _TrickleReply):
+                self._trickle(payload)
+                return
             declared = None
             if isinstance(payload, _ShortReply):
                 declared = payload.declared
@@ -1206,7 +1544,10 @@ def _recorded_judge_server(judge: _RecordedJudgeServer):
         def log_message(self, format, *args) -> None:
             debug(f"judge test server: {self.command} {self.path}")
 
-    return http.server.HTTPServer(("127.0.0.1", 0), JudgeRecorder)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), JudgeRecorder)
+    server.daemon_threads = False
+    server.block_on_close = True
+    return server
 
 
 class _RecordedJudgeServer:
@@ -1227,21 +1568,35 @@ class _RecordedJudgeServer:
     ) -> None:
         self.responder = responder
         self.records: list[_JudgeRequestRecord] = []
+        self.lock = threading.Lock()
+        self.cancelled = threading.Event()
+        self.in_flight = 0
+        self.max_in_flight = 0
         self.base_url = ""
         self.httpd = None
 
-    def __enter__(self) -> Self:
-        import threading
+    def enter(self) -> None:
+        with self.lock:
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
 
+    def leave(self) -> None:
+        with self.lock:
+            self.in_flight -= 1
+
+    def __enter__(self) -> Self:
         self.httpd = _recorded_judge_server(self)
         self.base_url = f"http://127.0.0.1:{self.httpd.server_port}"
-        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.serving_thread = threading.Thread(target=self.httpd.serve_forever)
+        self.serving_thread.start()
         return self
 
     def __exit__(self, *exc) -> bool:
         if self.httpd is not None:
+            self.cancelled.set()
             self.httpd.shutdown()
             self.httpd.server_close()
+            self.serving_thread.join()
         return False
 
 
@@ -1252,6 +1607,27 @@ class _ShortReply:
     def __init__(self, payload: bytes) -> None:
         self.payload = payload
         self.declared = len(payload) + 16
+
+
+_TRICKLED_BYTES = 25
+
+
+class _ShutdownRecorder(socket.socket):
+    subclass_shutdowns = 0
+
+    def shutdown(self, how: int) -> None:
+        self.subclass_shutdowns += 1
+        super().shutdown(how)
+
+
+class _TrickleReply(bytes):
+    at: int = 0
+
+
+def _trickle_reply(head: bytes, tail: bytes) -> _TrickleReply:
+    reply = _TrickleReply(head + tail)
+    reply.at = len(head)
+    return reply
 
 
 if TYPE_CHECKING:
@@ -1295,8 +1671,72 @@ def _scripted_replies(
 
 
 def _hanging_reply(record: _JudgeRequestRecord) -> bytes:
-    time.sleep(1.0)
+    record["cancelled"].wait(1.0)
     return b"{}"
+
+
+def _silent_reply(record: _JudgeRequestRecord) -> bytes:
+    record["cancelled"].wait()
+    return b"{}"
+
+
+def _raw_answer(record: _JudgeRequestRecord) -> bytes:
+    body = _systemone_answer_body(record, {}, "jev-test")
+    head = (
+        "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n"
+        f"Content-Length: {len(body)}\r\n\r\n"
+    )
+    return head.encode("ascii") + body
+
+
+def _trickled_body(record: _JudgeRequestRecord) -> bytes:
+    head, blank, body = _raw_answer(record).partition(b"\r\n\r\n")
+    return _trickle_reply(head + blank, body)
+
+
+def _trickled_head(record: _JudgeRequestRecord) -> bytes:
+    return _trickle_reply(b"", _raw_answer(record))
+
+
+def _held_answers(seconds: float) -> Callable[[_JudgeRequestRecord], bytes]:
+    def reply(record: _JudgeRequestRecord) -> bytes:
+        record["cancelled"].wait(seconds)
+        return _systemone_answer_body(record, {}, "jev-test")
+
+    return reply
+
+
+def _record_state(record: _JudgeRequestRecord) -> dict[str, str]:
+    return json.loads(record["body"])["state"]
+
+
+def _record_part(record: _JudgeRequestRecord) -> int:
+    return int(_record_state(record).get("part", "1 of 1").split(" of ")[0])
+
+
+def _joined_subject(records: list[_JudgeRequestRecord]) -> str:
+    ordered = sorted(records, key=_record_part)
+    return "".join(_record_state(record)["subject"] for record in ordered)
+
+
+def _part_replies(
+    by_part: dict[int, _JudgeReply], default: _JudgeReply
+) -> Callable[[_JudgeRequestRecord], tuple[int, bytes | _ShortReply, dict[str, str]]]:
+    def responder(
+        record: _JudgeRequestRecord,
+    ) -> tuple[int, bytes | _ShortReply, dict[str, str]]:
+        status, payload_source, extra_headers = by_part.get(
+            _record_part(record), default
+        )
+        if isinstance(payload_source, (bytes, _ShortReply)):
+            return status, payload_source, extra_headers
+        return status, payload_source(record), extra_headers
+
+    return responder
+
+
+def _judged(answers: dict[str, Answer], model: str = "jev-test") -> _JudgedChunk:
+    return _JudgedChunk(answers=answers, model=model)
 
 
 def _reply_missing_dimension(record: _JudgeRequestRecord) -> bytes:
@@ -1637,6 +2077,10 @@ def _selftest_questions(check: Callable[[str, object], None]) -> None:
         "stop asks the seven dimensions",
         set(build_questions("stop")) == dimension_ids,
     )
+    unjudged = build_questions("write", "page.tsx", False)
+    judged = build_questions("write", "page.tsx")
+    del judged["spec_completion"]
+    check("completeness not judged drops only spec_completion", unjudged == judged)
     every_question: dict[str, Question] = {}
     for questions in (
         build_questions("write", "page.tsx"),
@@ -1706,12 +2150,74 @@ def _selftest_question_wording(check: Callable[[str, object], None]) -> None:
     )
 
 
-def _selftest_fit_state(check: Callable[[str, object], None]) -> None:
-    print("\n=== Fit State ===")
-    text = "A" * 30000 + "B" * 10 + "C" * 30000
-    expected = "A" * 30000 + "\n…[10 chars omitted]…\n" + "C" * 30000
-    check("long state keeps head and tail with the omitted count", _fit_state(text) == expected)
-    check("short state passes through unchanged", _fit_state("hello") == "hello")
+def _selftest_chunk_text(check: Callable[[str, object], None]) -> None:
+    print("\n=== Chunk Text ===")
+    at_limit = "a" * CHUNK_MAX_BYTES
+    check("text at the limit is one chunk", _chunk_text(at_limit) == [at_limit])
+    check(
+        "one byte over with no newline cuts at the limit",
+        _chunk_text(at_limit + "a") == [at_limit, "a"],
+    )
+    check(
+        "newline exactly at half the prefix is the cut",
+        _chunk_text("abcd\nfghij", 8) == ["abcd\n", "fghij"],
+    )
+    check(
+        "newline just before half the prefix is not the cut",
+        _chunk_text("abc\nefghij", 8) == ["abc\nefgh", "ij"],
+    )
+    check(
+        "remainder that holds a newline is not cut",
+        _chunk_text("abcdefghi\nj", 8) == ["abcdefgh", "i\nj"],
+    )
+    check("empty string is one empty chunk", _chunk_text("") == [""])
+    lone = json.loads('"\\ud83d"')
+    for name, text, expected in (
+        ("three-byte character", "abcdefg\u20acx", ["abcdefg", "\u20acx"]),
+        ("four-byte character", "abcdef\U0001f600x", ["abcdef", "\U0001f600x"]),
+        ("lone surrogate", "abcdefg" + lone + "x", ["abcdefg", lone + "x"]),
+    ):
+        chunks = _chunk_text(text, 8)
+        check(
+            f"{name} at the cut stays whole and round-trips",
+            (chunks, "".join(chunks)) == (expected, text),
+        )
+    big = "".join(
+        f"row {index} \u20ac\U0001f600{lone}" + ("\n" if index % 5 else "")
+        for index in range(150000)
+    )
+    big_chunks = _chunk_text(big)
+    check(
+        "multi-megabyte text joins back equal within the limit",
+        (
+            "".join(big_chunks) == big,
+            len(big.encode("utf-8", "surrogatepass")) > 2_000_000,
+            all(
+                len(chunk.encode("utf-8", "surrogatepass")) <= CHUNK_MAX_BYTES
+                for chunk in big_chunks
+            ),
+        )
+        == (True, True, True),
+    )
+    try:
+        _chunk_text("abc", 3)
+        refused = False
+    except ValueError:
+        refused = True
+    check("limit under 4 fails", refused)
+
+
+def _selftest_combine(check: Callable[[str, object], None]) -> None:
+    print("\n=== Combine Verdicts ===")
+    cases: tuple[tuple[list[str | None], str | None, str], ...] = (
+        (["PASS", "FAIL", None], "FAIL", "FAIL with a failed chunk is FAIL"),
+        (["PASS", None], None, "PASS with a failed chunk skips the review"),
+        (["PASS", "PASS"], "PASS", "all PASS is PASS"),
+        (["PASS", "UNCERTAIN"], "UNCERTAIN", "PASS with UNCERTAIN is UNCERTAIN"),
+        (["UNCERTAIN"], "UNCERTAIN", "one element is its own verdict"),
+    )
+    for verdicts, expected, name in cases:
+        check(f"combine_verdicts: {name}", combine_verdicts(verdicts) == expected)
 
 
 def _selftest_verdict_rule(check: Callable[[str, object], None]) -> None:
@@ -1822,7 +2328,7 @@ def _selftest_scorecard(check: Callable[[str, object], None]) -> None:
     ]
     check(
         "lines sort by defect with the model line last",
-        render_scorecard("plan", ranked, "jev-test").split("\n") == expected_ranked,
+        render_scorecard("plan", [_judged(ranked)], True).split("\n") == expected_ranked,
     )
     concern = _score_answers("plan", {"correctness": {"0": 0.1, "1": 0.85, "2": 0.05}})
     expected_concern = [
@@ -1834,9 +2340,9 @@ def _selftest_scorecard(check: Callable[[str, object], None]) -> None:
     ]
     check(
         "level-1 line shows even below the defect threshold",
-        render_scorecard("plan", concern, "jev-test").split("\n") == expected_concern,
+        render_scorecard("plan", [_judged(concern)], True).split("\n") == expected_concern,
     )
-    clean = render_scorecard("plan", _score_answers("plan"), "jev-test").split("\n")
+    clean = render_scorecard("plan", [_judged(_score_answers("plan"))], True).split("\n")
     check(
         "clean review falls back to the no-defect line",
         clean
@@ -1847,7 +2353,7 @@ def _selftest_scorecard(check: Callable[[str, object], None]) -> None:
     )
     hot = {"0": 0.95, "1": 0.03, "2": 0.02}
     raised = render_scorecard(
-        "write", _score_answers("write", {"has_placeholder": 0.9}), "jev-test"
+        "write", [_judged(_score_answers("write", {"has_placeholder": 0.9}))], True
     ).split("\n")
     check(
         "raised spec_completion leads the write scorecard",
@@ -1866,12 +2372,129 @@ def _selftest_scorecard(check: Callable[[str, object], None]) -> None:
     )
     dropped_card = render_scorecard(
         "write",
-        _score_answers("write", {"correctness": hot, "is_executable_code": 0.4}),
-        "jev-test",
+        [_judged(_score_answers("write", {"correctness": hot, "is_executable_code": 0.4}))],
+        True,
     )
     check(
         "dropped dimension never reaches the scorecard",
         "correctness" not in dropped_card,
+    )
+
+
+def _selftest_chunk_scorecard(check: Callable[[str, object], None]) -> None:
+    print("\n=== Chunk Scorecard ===")
+    slop_line = (
+        "- slop: material defect (P(defect)=0.80) It contains filler that must not "
+        "ship: dead or commented-out code, duplicated blocks, generic names such as "
+        "helper or data, or comments that restate the code."
+    )
+    design_line = (
+        "- design: concrete concern (P(defect)=0.35) It works within the structure "
+        "but leaks an internal detail, duplicates an existing mechanism, or names "
+        "something misleadingly."
+    )
+    slop_hot = {"0": 0.8, "1": 0.15, "2": 0.05}
+    slop_warm = {"0": 0.4, "1": 0.3, "2": 0.3}
+    design_warm = {"0": 0.35, "1": 0.2, "2": 0.45}
+    clean = _score_answers("plan")
+    worse_second = render_scorecard(
+        "plan",
+        [
+            _judged(_score_answers("plan", {"slop": slop_warm})),
+            _judged(_score_answers("plan", {"slop": slop_hot})),
+        ],
+        False,
+    ).split("\n")
+    check(
+        "two chunks: the line comes from the worse chunk with its part suffix",
+        worse_second[0] == slop_line + " (part 2 of 2)",
+    )
+    tie = render_scorecard(
+        "plan",
+        [
+            _judged(_score_answers("plan", {"slop": slop_hot})),
+            _judged(_score_answers("plan", {"slop": slop_hot})),
+        ],
+        False,
+    ).split("\n")
+    check("a tie keeps the earlier chunk", tie[0] == slop_line + " (part 1 of 2)")
+    one_sided = render_scorecard(
+        "plan",
+        [_judged(clean), _judged(_score_answers("plan", {"design": design_warm}))],
+        False,
+    ).split("\n")
+    check(
+        "a dimension with a line in one chunk only keeps that line",
+        one_sided[0] == design_line + " (part 2 of 2)",
+    )
+    added = render_scorecard(
+        "plan",
+        [
+            _judged(_score_answers("plan", {"slop": slop_hot}), "jev-b"),
+            _SkippedChunk(cause="judge request failed: HTTP 500"),
+            _judged(clean, "jev-a"),
+            _judged(clean, "jev-b"),
+        ],
+        False,
+    ).split("\n")
+    check(
+        "both added lines appear in the stated order before the model line",
+        added[1:]
+        == [
+            "Completeness was not judged: the subject was split into 4 parts.",
+            "Parts not judged: 1 of 4 (judge request failed: HTTP 500).",
+            "Judged by jev-b, jev-a.",
+        ],
+    )
+    check(
+        "two models are named once each in chunk order",
+        added[-1] == "Judged by jev-b, jev-a.",
+    )
+    lowest = render_scorecard(
+        "plan",
+        [
+            _judged(clean),
+            _SkippedChunk(cause="judge request failed: HTTP 400"),
+            _SkippedChunk(cause="judge request failed: HTTP 404"),
+        ],
+        False,
+    ).split("\n")
+    check(
+        "parts line names the cause of the lowest-numbered failed chunk",
+        lowest[-2] == "Parts not judged: 2 of 3 (judge request failed: HTTP 400).",
+    )
+    fallback = render_scorecard(
+        "plan",
+        [_judged(clean), _judged(_score_answers("plan", {"correctness": {"0": 0.2, "1": 0.0, "2": 0.8}}))],
+        False,
+    ).split("\n")
+    check(
+        "fallback line takes the highest defect over all judged chunks",
+        fallback[0] == "No dimension shows a material defect (highest P(defect)=0.20).",
+    )
+    check(
+        "one chunk is unchanged",
+        render_scorecard(
+            "plan",
+            [_judged(_score_answers("plan", {"slop": slop_hot, "design": design_warm}))],
+            True,
+        ).split("\n")
+        == [slop_line, design_line, "Judged by jev-test."],
+    )
+    check(
+        "one chunk without completeness names the request",
+        render_scorecard("plan", [_judged(clean)], False).split("\n")[-2]
+        == "Completeness was not judged: the request does not fit in one part with the subject.",
+    )
+    unasked = _score_answers("write", {"has_placeholder": 0.9})
+    del unasked["spec_completion"]
+    check(
+        "write answers without spec_completion derive a verdict and a scorecard",
+        (
+            derive_verdict("write", unasked),
+            render_scorecard("write", [_judged(unasked)], False).split("\n")[-1],
+        )
+        == ("PASS", "Judged by jev-test."),
     )
 
 
@@ -2362,17 +2985,19 @@ def _selftest_dispatch(check: Callable[[str, object], None]) -> None:
                 stop_hook["transcript_path"] = transcript_path
                 mark = len(judge.records)
                 _dispatch_hook_payload(stop_hook)
-                subject = ""
-                if len(judge.records) > mark:
-                    body = json.loads(judge.records[mark]["body"])
-                    subject = body["state"]["subject"]
+                joined = _joined_subject(judge.records[mark:])
                 check(
-                    "stop subject is the transcript tail, not the whole file",
+                    "stop subject is the whole transcript, joined in part order",
                     (
-                        tail_marker in subject,
-                        len(subject) < len(transcript_bytes),
+                        joined == _redact(transcript_bytes.decode()),
+                        joined.startswith(head_marker),
                     )
                     == (True, True),
+                )
+                check(
+                    "stop without a last assistant message reads a transcript over 500,000 bytes in full",
+                    (len(transcript_bytes) > 500_000, head_marker in joined, tail_marker in joined)
+                    == (True, True, True),
                 )
             finally:
                 os.unlink(transcript_path)
@@ -2416,6 +3041,486 @@ def _selftest_dispatch(check: Callable[[str, object], None]) -> None:
                     f"missing key emits the skip notice on {name}",
                     (code, _parsed_hook_output(out)) == (0, skip_notice),
                 )
+    finally:
+        _restore_env("TYPESAFE_API_KEY", prev_key)
+        _restore_env("TYPESAFE_BASE_URL", prev_base)
+        _restore_env("CODEX_REFLECTOR_ENABLED", prev_enabled)
+
+
+def _selftest_chunk_dispatch(check: Callable[[str, object], None]) -> None:
+    print("\n=== Chunk Dispatch ===")
+    hot = {"0": 0.95, "1": 0.03, "2": 0.02}
+    ok: _JudgeReply = (200, _answers_reply({}, "jev-test"), {})
+    defect: _JudgeReply = (200, _answers_reply({"correctness": hot}, "jev-test"), {})
+    replies: dict[int, _JudgeReply] = {}
+    content = "value = 1\n" * 7000
+    prev_key = os.environ.get("TYPESAFE_API_KEY")
+    prev_base = os.environ.get("TYPESAFE_BASE_URL")
+    prev_enabled = os.environ.get("CODEX_REFLECTOR_ENABLED")
+    os.environ["TYPESAFE_API_KEY"] = "test-key-1234"
+    os.environ.pop("CODEX_REFLECTOR_ENABLED", None)
+    try:
+        with _RecordedJudgeServer(_part_replies(replies, ok)) as judge:
+            os.environ["TYPESAFE_BASE_URL"] = judge.base_url
+            mark = len(judge.records)
+            code, out, err = _dispatch_hook_payload(
+                _write_change_hook(content, instruction="Ship it")
+            )
+            sent = judge.records[mark:]
+            states = [_record_state(record) for record in sent]
+            message = str(_parsed_hook_output(out).get("systemMessage", ""))
+            check(
+                "oversized write makes one request per chunk",
+                (len(sent), len(_chunk_text(content))) == (3, 3),
+            )
+            check(
+                "recorded subjects join to the redacted subject",
+                _joined_subject(sent) == _redact(content),
+            )
+            check(
+                "each chunk request carries its part",
+                sorted(state.get("part", "") for state in states)
+                == ["1 of 3", "2 of 3", "3 of 3"],
+            )
+            check(
+                "split subject sends no request field and no spec_completion question",
+                (
+                    any("request" in state for state in states),
+                    any(
+                        "spec_completion" in json.loads(record["body"])["questions"]
+                        for record in sent
+                    ),
+                )
+                == (False, False),
+            )
+            check(
+                "split write scorecard holds the split line",
+                (
+                    code,
+                    "Completeness was not judged: the subject was split into 3 parts."
+                    in message.split("\n"),
+                )
+                == (0, True),
+            )
+            mark = len(judge.records)
+            code, out, err = _dispatch_hook_payload(
+                _write_change_hook("a = 1\n" * 4000, instruction="Do it " * 1000)
+            )
+            sent = judge.records[mark:]
+            message = str(_parsed_hook_output(out).get("systemMessage", ""))
+            check(
+                "subject that fits beside an oversized request makes one request without request",
+                (len(sent), sorted(_record_state(sent[0])) if sent else [])
+                == (1, ["file", "subject"]),
+            )
+            check(
+                "subject that fits beside an oversized request gives the one-chunk completeness line",
+                "Completeness was not judged: the request does not fit in one part with the subject."
+                in message.split("\n"),
+            )
+            replies[3] = defect
+            code, out, err = _dispatch_hook_payload(_write_change_hook(content))
+            message = str(_parsed_hook_output(out).get("systemMessage", ""))
+            check(
+                "a defect only in the last chunk gives FAIL",
+                (code, "FAIL" in message, "(part 3 of 3)" in message) == (0, True, True),
+            )
+            replies.clear()
+            replies[2] = defect
+            stop_hook = _session_stop_hook()
+            stop_hook["last_assistant_message"] = "Done the work.\n" * 5000
+            code, out, err = _dispatch_hook_payload(stop_hook)
+            check(
+                "stop with a block-level defect in a middle chunk exits 2",
+                (code, "(part 2 of 3)" in err, out) == (2, True, ""),
+            )
+            replies.clear()
+            replies[2] = (400, b"{}", {})
+            replies[3] = (404, b"{}", {})
+            code, out, err = _dispatch_hook_payload(_write_change_hook(content))
+            check(
+                "no FAIL with failed chunks 2 and 3 skips with the cause of chunk 2",
+                (code, _parsed_hook_output(out))
+                == (
+                    0,
+                    {
+                        "systemMessage": "codex-reflector: review skipped: judge request failed: HTTP 400"
+                    },
+                ),
+            )
+    finally:
+        _restore_env("TYPESAFE_API_KEY", prev_key)
+        _restore_env("TYPESAFE_BASE_URL", prev_base)
+        _restore_env("CODEX_REFLECTOR_ENABLED", prev_enabled)
+
+
+def _selftest_chunk_transport(check: Callable[[str, object], None]) -> None:
+    print("\n=== Chunk Transport ===")
+    global _JUDGE_BACKOFF_CAP_SECS, _JUDGE_RANDOM, _JUDGE_REVIEW_DEADLINE_SECS
+    prev_cap, prev_random = _JUDGE_BACKOFF_CAP_SECS, _JUDGE_RANDOM
+    prev_deadline = _JUDGE_REVIEW_DEADLINE_SECS
+    prev_key = os.environ.get("TYPESAFE_API_KEY")
+    prev_base = os.environ.get("TYPESAFE_BASE_URL")
+    os.environ["TYPESAFE_API_KEY"] = "test-key-1234"
+    hot = {"0": 0.95, "1": 0.03, "2": 0.02}
+    ok: _JudgeReply = (200, _answers_reply({}, "jev-test"), {})
+    two_parts = "line\n" * 8000
+    twenty_parts = "row\n" * (CHUNK_MAX_BYTES * 5)
+
+    def low_draw() -> float:
+        return 0.0
+
+    try:
+        samples = [
+            (
+                min(0.5 * (2 ** attempt), _JUDGE_BACKOFF_CAP_SECS),
+                _retry_wait(attempt, None, 60.0),
+            )
+            for attempt in range(_JUDGE_MAX_ATTEMPTS)
+            for _ in range(200)
+        ]
+        check(
+            "each computed wait lies between half the nominal wait and the nominal wait",
+            all(0.5 * nominal <= wait <= nominal for nominal, wait in samples),
+        )
+        _JUDGE_RANDOM = low_draw
+        check(
+            "the replaced random source at its low end gives half the nominal wait",
+            _retry_wait(1, None, 60.0) == 0.5,
+        )
+        check(
+            "a Retry-After wait is not changed",
+            _retry_wait(2, {"Retry-After": "0.3"}, 60.0) == 0.3,
+        )
+        check("a wait is at most the time left", _retry_wait(2, None, 0.05) == 0.05)
+        _JUDGE_BACKOFF_CAP_SECS = 0.01
+        fail_then_500 = _part_replies(
+            {
+                1: (200, _answers_reply({"correctness": hot}, "jev-test"), {}),
+                2: (500, b"{}", {}),
+            },
+            ok,
+        )
+        with _RecordedJudgeServer(fail_then_500) as judge:
+            os.environ["TYPESAFE_BASE_URL"] = judge.base_url
+            verdict, body = judge_review("plan", {"subject": two_parts})
+            second = [record for record in judge.records if _record_part(record) == 2]
+            check(
+                "FAIL in chunk 1 stands over HTTP 500 on every attempt of chunk 2",
+                (
+                    verdict,
+                    len(second),
+                    "Parts not judged: 1 of 2 (judge request failed: HTTP 500)."
+                    in body.split("\n"),
+                )
+                == ("FAIL", _JUDGE_MAX_ATTEMPTS, True),
+            )
+        refuse_first = _part_replies(
+            {1: (401, b"{}", {})}, (200, _held_answers(0.5), {})
+        )
+        with _RecordedJudgeServer(refuse_first) as judge:
+            os.environ["TYPESAFE_BASE_URL"] = judge.base_url
+            verdict, notice = judge_review("plan", {"subject": twenty_parts})
+            late = [record for record in judge.records if _record_part(record) >= 9]
+            check(
+                "HTTP 401 on chunk 1 of 20 stops chunks 9 to 20 "
+                "(the 500 ms hold on other chunks is a timing margin)",
+                (verdict, notice, late)
+                == (
+                    None,
+                    "codex-reflector: review skipped: judge request failed: HTTP 401",
+                    [],
+                ),
+            )
+        with _RecordedJudgeServer(
+            _part_replies({}, (200, _held_answers(0.2), {}))
+        ) as judge:
+            os.environ["TYPESAFE_BASE_URL"] = judge.base_url
+            verdict, _ = judge_review("plan", {"subject": twenty_parts})
+            check(
+                "stub never sees more than 8 requests in flight for 20 chunks",
+                (verdict, len(judge.records), 1 < judge.max_in_flight <= 8)
+                == ("PASS", 20, True),
+            )
+        _JUDGE_REVIEW_DEADLINE_SECS = 1.0
+        with _RecordedJudgeServer(_part_replies({}, (200, _silent_reply, {}))) as judge:
+            os.environ["TYPESAFE_BASE_URL"] = judge.base_url
+            started = time.monotonic()
+            verdict, notice = judge_review("plan", {"subject": "Add the retry loop."})
+            elapsed = time.monotonic() - started
+            check(
+                "1 s deadline ends a silent review with judge request timed out in under 4 s",
+                (verdict, notice, elapsed < 4.0)
+                == (None, "codex-reflector: review skipped: judge request timed out", True),
+            )
+    finally:
+        _JUDGE_BACKOFF_CAP_SECS, _JUDGE_RANDOM = prev_cap, prev_random
+        _JUDGE_REVIEW_DEADLINE_SECS = prev_deadline
+        _restore_env("TYPESAFE_API_KEY", prev_key)
+        _restore_env("TYPESAFE_BASE_URL", prev_base)
+
+
+def _selftest_review_bounds(check: Callable[[str, object], None]) -> None:
+    print("\n=== Review Deadline ===")
+    global _JUDGE_REVIEW_DEADLINE_SECS
+    prev_deadline = _JUDGE_REVIEW_DEADLINE_SECS
+    prev_key = os.environ.get("TYPESAFE_API_KEY")
+    prev_base = os.environ.get("TYPESAFE_BASE_URL")
+    os.environ["TYPESAFE_API_KEY"] = "test-key-1234"
+    timed_out = "codex-reflector: review skipped: judge request timed out"
+    skew = [0.0]
+
+    def skewed_clock() -> float:
+        return time.monotonic() + skew[0]
+
+    def late_answer(record: _JudgeRequestRecord) -> bytes:
+        skew[0] = 3600.0
+        return _systemone_answer_body(record, {}, "jev-test")
+
+    try:
+        review = _Review()
+        review.clock = skewed_clock
+        with _RecordedJudgeServer(_scripted_replies([(200, late_answer, {})])) as judge:
+            os.environ["TYPESAFE_BASE_URL"] = judge.base_url
+            answers, cause = invoke_judge(
+                {"subject": "Add the retry loop."}, build_questions("plan"), review
+            )
+            check(
+                "a valid answer completed after the deadline is discarded without retry",
+                (answers, cause, len(judge.records))
+                == (None, "judge request timed out", 1),
+            )
+        _JUDGE_REVIEW_DEADLINE_SECS = 1.0
+        trickles = (
+            ("a body sent one byte per 0.2 s", _trickled_body),
+            ("a status line and headers sent one byte per 0.2 s", _trickled_head),
+        )
+        for name, reply in trickles:
+            with _RecordedJudgeServer(_scripted_replies([(200, reply, {})])) as judge:
+                os.environ["TYPESAFE_BASE_URL"] = judge.base_url
+                started = time.monotonic()
+                verdict, notice = judge_review("plan", {"subject": "Add the retry loop."})
+                elapsed = time.monotonic() - started
+                check(
+                    f"{name} ends at the 1 s deadline in under 3 s",
+                    (verdict, notice, elapsed < 3.0) == (None, timed_out, True),
+                )
+        forty_parts = "row\n" * (CHUNK_MAX_BYTES * 10)
+        with _RecordedJudgeServer(_part_replies({}, (200, _silent_reply, {}))) as judge:
+            os.environ["TYPESAFE_BASE_URL"] = judge.base_url
+            started = time.monotonic()
+            verdict, notice = judge_review("plan", {"subject": forty_parts})
+            elapsed = time.monotonic() - started
+            check(
+                "40 queued chunks share one 1 s deadline against a silent server "
+                "and end in under 4 s (five waves of 8 would take 5 s)",
+                (len(_chunk_text(forty_parts)), verdict, notice, elapsed < 4.0)
+                == (40, None, timed_out, True),
+            )
+    finally:
+        _JUDGE_REVIEW_DEADLINE_SECS = prev_deadline
+        _restore_env("TYPESAFE_API_KEY", prev_key)
+        _restore_env("TYPESAFE_BASE_URL", prev_base)
+
+
+def _selftest_review_refusal(check: Callable[[str, object], None]) -> None:
+    print("\n=== Review Refusal ===")
+    review = _Review()
+    review.refuse("a")
+    review.refuse("b")
+    check(
+        "the first refusal cause is kept and admit returns it",
+        (review.refused, review.admit()) == ("a", "a"),
+    )
+    left, right = socket.socketpair()
+    right.settimeout(2.0)
+    recorder = _ShutdownRecorder(left.family, left.type, left.proto, fileno=left.detach())
+    try:
+        _shut_socket(recorder)
+        check(
+            "expiry shuts the raw socket and skips a subclass shutdown, which on ssl.SSLSocket drops the TLS layer first",
+            (recorder.subclass_shutdowns, right.recv(1)) == (0, b""),
+        )
+    finally:
+        recorder.close()
+        right.close()
+    prev_key = os.environ.get("TYPESAFE_API_KEY")
+    prev_base = os.environ.get("TYPESAFE_BASE_URL")
+    os.environ["TYPESAFE_API_KEY"] = "test-key-1234"
+    refuse_first = _part_replies(
+        {1: (403, b"{}", {})}, (200, _held_answers(0.5), {})
+    )
+    try:
+        with _RecordedJudgeServer(refuse_first) as judge:
+            os.environ["TYPESAFE_BASE_URL"] = judge.base_url
+            states, completeness_judged = _chunk_states(
+                {"subject": "row\n" * (CHUNK_MAX_BYTES * 5)}
+            )
+            results = _judge_chunks(
+                states, build_questions("plan", "", completeness_judged)
+            )
+            started = {_record_part(record) for record in judge.records}
+            unstarted = [
+                _chunk_cause(result)
+                for part, result in enumerate(results, 1)
+                if part not in started
+            ]
+            check(
+                "HTTP 403 on chunk 1 of 20 starts no chunk after 8, and each chunk "
+                "that did not start has the 403 cause "
+                "(the 500 ms hold on other chunks is a timing margin)",
+                (
+                    1 in started,
+                    max(started, default=0) <= 8,
+                    unstarted == ["judge request failed: HTTP 403"] * (20 - len(started)),
+                )
+                == (True, True, True),
+            )
+    finally:
+        _restore_env("TYPESAFE_API_KEY", prev_key)
+        _restore_env("TYPESAFE_BASE_URL", prev_base)
+
+
+def _request_shape(sent: list[_JudgeRequestRecord]) -> tuple[int, bool, bool]:
+    if not sent:
+        return 0, False, False
+    body = json.loads(sent[0]["body"])
+    return len(sent), "request" in body["state"], "spec_completion" in body["questions"]
+
+
+def _huge_probability_reply(record: _JudgeRequestRecord) -> bytes:
+    payload = json.loads(_systemone_answer_body(record, {}, "jev-test"))
+    payload["answers"]["correctness"]["probabilities"]["0"] = 10**400
+    return json.dumps(payload).encode("utf-8")
+
+
+def _fast_apply_subject(judge: _RecordedJudgeServer, applied_text: str) -> str:
+    with tempfile.TemporaryDirectory() as root:
+        applied = Path(root) / "big.py"
+        applied.write_text(applied_text, encoding="utf-8")
+        mark = len(judge.records)
+        _dispatch_hook_payload(
+            {
+                "hook_event_name": "PostToolUse",
+                "cwd": root,
+                "tool_name": "mcp__morph__edit_file",
+                "tool_input": {
+                    "file_path": str(applied),
+                    "code_edit": "b = 2",
+                    "instruction": "Set b",
+                },
+            }
+        )
+        return _joined_subject(judge.records[mark:])
+
+
+def _selftest_chunk_routes(check: Callable[[str, object], None]) -> None:
+    print("\n=== Chunk Routes ===")
+    hot = {"0": 0.95, "1": 0.03, "2": 0.02}
+    ok: _JudgeReply = (200, _answers_reply({}, "jev-test"), {})
+    replies: dict[int, _JudgeReply] = {1: (200, _huge_probability_reply, {})}
+    prev_key = os.environ.get("TYPESAFE_API_KEY")
+    prev_base = os.environ.get("TYPESAFE_BASE_URL")
+    prev_enabled = os.environ.get("CODEX_REFLECTOR_ENABLED")
+    os.environ["TYPESAFE_API_KEY"] = "test-key-1234"
+    os.environ.pop("CODEX_REFLECTOR_ENABLED", None)
+    try:
+        with _RecordedJudgeServer(_part_replies(replies, ok)) as judge:
+            os.environ["TYPESAFE_BASE_URL"] = judge.base_url
+            code, out, _ = _dispatch_hook_payload(_write_change_hook("value = 1\n"))
+            check(
+                "a 401-digit integer probability skips the review with one notice "
+                "and no traceback",
+                (code, _parsed_hook_output(out))
+                == (
+                    0,
+                    {
+                        "systemMessage": "codex-reflector: review skipped: judge answer was malformed"
+                    },
+                ),
+            )
+            replies.clear()
+            marker = "FAST-APPLY-TAIL-MARKER"
+            applied_text = "a" * 50_000 + marker + "b" * (10_000 - len(marker))
+            check(
+                "Fast Apply sends a 60,000-character file whole, "
+                "with the marker after character 50,000",
+                marker in _fast_apply_subject(judge, applied_text),
+            )
+            subject = "\u00e9" * 13_000
+            request = "\u00fc" * 1_000
+            mark = len(judge.records)
+            _dispatch_hook_payload(_write_change_hook(subject, instruction=request))
+            check(
+                "subject plus request at exactly 28,000 UTF-8 bytes (14,000 characters) "
+                "makes one call with request and spec_completion",
+                _request_shape(judge.records[mark:]) == (1, True, True),
+            )
+            mark = len(judge.records)
+            _dispatch_hook_payload(_write_change_hook(subject, instruction=request + "x"))
+            check(
+                "one byte more makes one call without request and without spec_completion",
+                _request_shape(judge.records[mark:]) == (1, False, False),
+            )
+            mark = len(judge.records)
+            _dispatch_hook_payload(_write_change_hook("a" * (CHUNK_MAX_BYTES + 1)))
+            check(
+                "a write subject one byte over the limit makes two calls",
+                len(judge.records[mark:]) == 2,
+            )
+            secret_path = "src/password=hunter2/patch.py"
+            mark = len(judge.records)
+            _dispatch_hook_payload(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "cwd": os.getcwd(),
+                    "tool_name": "Write",
+                    "tool_input": {"file_path": secret_path, "content": "value = 1\n" * 7000},
+                }
+            )
+            files = [_record_state(record).get("file") for record in judge.records[mark:]]
+            check(
+                "every part of a split write holds the same whole redacted file value",
+                (len(files), set(files), _redact(secret_path) == secret_path)
+                == (3, {_redact(secret_path)}, False),
+            )
+            plan = "# Plan\n\npassword = hunter2\n" + "- step\n" * 9000
+            mark = len(judge.records)
+            _dispatch_hook_payload(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "cwd": os.getcwd(),
+                    "tool_name": "ExitPlanMode",
+                    "tool_response": {"plan": plan},
+                }
+            )
+            sent = judge.records[mark:]
+            check(
+                "a plan over the limit goes out in parts that join to the redacted plan",
+                (len(sent) > 1, _joined_subject(sent) == _redact(plan), _redact(plan) == plan)
+                == (True, True, False),
+            )
+            replies[1] = (
+                200,
+                _answers_reply({"is_executable_code": 0.1, "correctness": hot}, "jev-test"),
+                {},
+            )
+            replies[2] = (
+                200,
+                _answers_reply({"is_executable_code": 0.9, "correctness": hot}, "jev-test"),
+                {},
+            )
+            verdict, body = judge_review(
+                "write", {"file": "src/patch.py", "subject": "line\n" * 8000}, "src/patch.py"
+            )
+            correctness = [
+                line for line in body.split("\n") if line.startswith("- correctness:")
+            ]
+            check(
+                "mixed code screens: chunk 1 drops correctness, chunk 2 keeps it",
+                (verdict, [line.endswith("(part 2 of 2)") for line in correctness])
+                == ("FAIL", [True]),
+            )
     finally:
         _restore_env("TYPESAFE_API_KEY", prev_key)
         _restore_env("TYPESAFE_BASE_URL", prev_base)
@@ -2512,8 +3617,8 @@ def _selftest_transport_loopback_proxy(check: Callable[[str, object], None]) -> 
         _restore_env("TYPESAFE_BASE_URL", prev_base)
 
 
-def _selftest_redact_before_fit(check: Callable[[str, object], None]) -> None:
-    print("\n=== Redact Before Fit ===")
+def _selftest_redact_before_chunk(check: Callable[[str, object], None]) -> None:
+    print("\n=== Redact Before Chunk ===")
     token = "sk-" + "b" * 24
     prev_key = os.environ.get("TYPESAFE_API_KEY")
     prev_base = os.environ.get("TYPESAFE_BASE_URL")
@@ -2524,11 +3629,17 @@ def _selftest_redact_before_fit(check: Callable[[str, object], None]) -> None:
         ok_reply = _scripted_replies([(200, _answers_reply({}, "jev-test"), {})])
         with _RecordedJudgeServer(ok_reply) as judge:
             os.environ["TYPESAFE_BASE_URL"] = judge.base_url
-            _dispatch_hook_payload(_write_change_hook("x" * 60000 + token))
-            sent = judge.records[0]["body"]
+            content = "x" * (CHUNK_MAX_BYTES - 10) + token + "\n" + "y" * 1000
+            _dispatch_hook_payload(_write_change_hook(content))
+            bodies = [record["body"] for record in judge.records]
+            pieces = (token, token[:8], token[-8:])
             check(
-                "token inside the kept tail is redacted before fitting",
-                (token.encode() in sent, b"[REDACTED]" in sent) == (False, True),
+                "token across an unredacted chunk boundary is in no request",
+                (
+                    len(bodies),
+                    any(piece.encode() in body for body in bodies for piece in pieces),
+                )
+                == (2, False),
             )
     finally:
         _restore_env("TYPESAFE_API_KEY", prev_key)
@@ -2572,17 +3683,24 @@ def run_self_test() -> None:
         _selftest_stateless_stop(check)
         _selftest_questions(check)
         _selftest_question_wording(check)
-        _selftest_fit_state(check)
+        _selftest_chunk_text(check)
+        _selftest_combine(check)
         _selftest_verdict_rule(check)
         _selftest_amendment_rule(check)
         _selftest_screens(check)
         _selftest_scorecard(check)
+        _selftest_chunk_scorecard(check)
         _selftest_transport_wire(check)
         _selftest_transport_failures(check)
         _selftest_transport_bad_key(check)
         _selftest_transport_loopback_proxy(check)
-        _selftest_redact_before_fit(check)
+        _selftest_redact_before_chunk(check)
         _selftest_dispatch(check)
+        _selftest_chunk_dispatch(check)
+        _selftest_chunk_transport(check)
+        _selftest_review_bounds(check)
+        _selftest_review_refusal(check)
+        _selftest_chunk_routes(check)
         _selftest_secrets(check)
     finally:
         for name, value in saved_env.items():

@@ -145,7 +145,7 @@ export function redact(text: string): string {
 export const FAIL_AT_ADVISORY = 0.7;
 export const PASS_BELOW = 0.3;
 export const BLOCK_AT = 0.9;
-export const STATE_MAX_CHARS = 60_000;
+export const CHUNK_MAX_BYTES = 28_000;
 
 export type Route = "write" | "plan" | "stop";
 
@@ -353,10 +353,52 @@ export const BASH_GUARD_QUESTIONS: Questions = Object.fromEntries(
 
 const LEVEL_NAMES: readonly [string, string, string] = ["material defect", "concrete concern", "no concern"];
 
-export function fitState(text: string, max = STATE_MAX_CHARS): string {
-	if (text.length <= max) return text;
-	const half = max / 2;
-	return `${text.slice(0, half)}\n…[${text.length - max} chars omitted]…\n${text.slice(-half)}`;
+function codePointBytes(codePoint: number): number {
+	if (codePoint < 0x80) return 1;
+	if (codePoint < 0x800) return 2;
+	if (codePoint < 0x10000) return 3;
+	return 4;
+}
+
+function utf8Length(text: string): number {
+	let total = 0;
+	for (let index = 0; index < text.length; ) {
+		const codePoint = text.codePointAt(index) as number;
+		total += codePointBytes(codePoint);
+		index += codePoint > 0xffff ? 2 : 1;
+	}
+	return total;
+}
+
+export function chunkText(text: string, limit = CHUNK_MAX_BYTES): string[] {
+	if (limit < 4) throw new Error(`chunk limit must be at least 4, got ${limit}`);
+	const chunks: string[] = [];
+	let start = 0;
+	let remaining = utf8Length(text);
+	while (remaining > limit) {
+		let bytes = 0;
+		let end = start;
+		let newlineIndex = -1;
+		let newlineBytes = -1;
+		while (end < text.length) {
+			const codePoint = text.codePointAt(end) as number;
+			const cost = codePointBytes(codePoint);
+			if (bytes + cost > limit) break;
+			bytes += cost;
+			if (codePoint === 0x0a) {
+				newlineIndex = end;
+				newlineBytes = bytes - 1;
+			}
+			end += codePoint > 0xffff ? 2 : 1;
+		}
+		const cutAtNewline = newlineBytes >= 0 && 2 * newlineBytes >= bytes;
+		const cut = cutAtNewline ? newlineIndex + 1 : end;
+		chunks.push(text.slice(start, cut));
+		remaining -= cutAtNewline ? newlineBytes + 1 : bytes;
+		start = cut;
+	}
+	chunks.push(text.slice(start));
+	return chunks;
 }
 
 function scoreQuestion(subject: string, dimension: DimensionSpec): ScoreQuestion {
@@ -367,10 +409,13 @@ function scoreQuestion(subject: string, dimension: DimensionSpec): ScoreQuestion
 	};
 }
 
-export function buildQuestions(route: Route, file?: string): Questions {
+export function buildQuestions(route: Route, file?: string, completenessJudged = true): Questions {
 	const questions: Questions = {};
 	const subject = SUBJECT_NOUN[route];
-	for (const dimension of DIMENSIONS) questions[dimension.id] = scoreQuestion(subject, dimension);
+	for (const dimension of DIMENSIONS) {
+		if (!completenessJudged && dimension.id === "spec_completion") continue;
+		questions[dimension.id] = scoreQuestion(subject, dimension);
+	}
 	if (route === "write") {
 		const name = file ? file.slice(file.lastIndexOf("/") + 1) : "";
 		const dot = name.lastIndexOf(".");
@@ -446,28 +491,109 @@ export function deriveVerdict(route: Route, answers: Record<string, Answer>): Ve
 	return "UNCERTAIN";
 }
 
+export function combineVerdicts(verdicts: readonly (Verdict | undefined)[]): Verdict | undefined {
+	if (verdicts.includes("FAIL")) return "FAIL";
+	if (verdicts.includes(undefined)) return undefined;
+	return verdicts.every((verdict) => verdict === "PASS") ? "PASS" : "UNCERTAIN";
+}
+
 function shownLevel(row: DimensionRow): Level {
 	if (row.defect >= 0.5) return 0;
 	if (row.defect >= PASS_BELOW && row.likely === 2) return 1;
 	return row.likely;
 }
 
-export function renderScorecard(route: Route, answers: Record<string, Answer>, model: string): string {
-	const lines: string[] = [];
-	const rows = remainingDimensions(route, answers).sort((a, b) => b.defect - a.defect);
-	const highest = Math.max(0, ...rows.map((row) => row.defect));
-	for (const row of rows) {
-		if (row.defect < PASS_BELOW && row.likely === 2) continue;
-		const shown = shownLevel(row);
-		const criterion = row.criteria[shown];
-		lines.push(
-			`- ${row.id}: ${LEVEL_NAMES[shown]} (P(defect)=${row.defect.toFixed(2)}) ${criterion}`,
-		);
+export type ChunkResult =
+	| { answers: Record<string, Answer>; model: string }
+	| { cause: string };
+
+interface ScorecardLine {
+	id: string;
+	defect: number;
+	shown: Level;
+	criterion: string;
+	part: number;
+}
+
+function dimensionLines(
+	route: Route,
+	results: readonly ChunkResult[],
+): { lines: ScorecardLine[]; highest: number } {
+	const winners = new Map<string, ScorecardLine>();
+	let highest = 0;
+	for (let part = 0; part < results.length; part++) {
+		const result = results[part];
+		if (!("answers" in result)) continue;
+		const rows = remainingDimensions(route, result.answers);
+		for (const row of rows) highest = Math.max(highest, row.defect);
+		for (const row of rows) {
+			if (row.defect < PASS_BELOW && row.likely === 2) continue;
+			const previous = winners.get(row.id);
+			if (previous && row.defect <= previous.defect) continue;
+			const shown = shownLevel(row);
+			winners.set(row.id, {
+				id: row.id,
+				defect: row.defect,
+				shown,
+				criterion: row.criteria[shown],
+				part,
+			});
+		}
 	}
-	if (!lines.length) {
+	const lines = [...DIMENSIONS, ...UI_DIMENSIONS]
+		.map((dimension) => winners.get(dimension.id))
+		.filter((line): line is ScorecardLine => line !== undefined)
+		.sort((a, b) => b.defect - a.defect);
+	return { lines, highest };
+}
+
+function completenessLine(total: number): string {
+	return total > 1
+		? `Completeness was not judged: the subject was split into ${total} parts.`
+		: "Completeness was not judged: the request does not fit in one part with the subject.";
+}
+
+function partsNotJudgedLine(results: readonly ChunkResult[]): string | undefined {
+	const failures = results.filter(
+		(result): result is { cause: string } => "cause" in result,
+	);
+	if (failures.length === 0) return undefined;
+	return `Parts not judged: ${failures.length} of ${results.length} (${failures[0].cause}).`;
+}
+
+function judgedModels(results: readonly ChunkResult[]): string[] {
+	const models: string[] = [];
+	for (const result of results) {
+		if (!("model" in result)) continue;
+		if (!models.includes(result.model)) models.push(result.model);
+	}
+	return models;
+}
+
+export function renderScorecard(
+	route: Route,
+	results: readonly ChunkResult[],
+	completenessJudged: boolean,
+): string {
+	const total = results.length;
+	if (completenessJudged && total > 1) {
+		throw new Error("completeness is judged only with one chunk");
+	}
+	const { lines: dimensions, highest } = dimensionLines(route, results);
+	const lines: string[] = [];
+	if (dimensions.length === 0) {
 		lines.push(`No dimension shows a material defect (highest P(defect)=${highest.toFixed(2)}).`);
 	}
-	lines.push(`Judged by ${model}.`);
+	for (const line of dimensions) {
+		const suffix = total > 1 ? ` (part ${line.part + 1} of ${total})` : "";
+		lines.push(
+			`- ${line.id}: ${LEVEL_NAMES[line.shown]} (P(defect)=${line.defect.toFixed(2)}) ${line.criterion}${suffix}`,
+		);
+	}
+	if (!completenessJudged) lines.push(completenessLine(total));
+	const parts = partsNotJudgedLine(results);
+	if (parts) lines.push(parts);
+	lines.push(`Judged by ${judgedModels(results).join(", ")}.`);
 	return lines.join("\n");
 }
 
@@ -523,38 +649,85 @@ function requireAnswers(questions: Questions, answers: Record<string, Answer>): 
 	}
 }
 
-/** One judge round-trip per route, failing open with a single warning notice:
- * a route with no judge answer proceeds unreviewed and never blocks. */
-async function runJudge(
+const JUDGE_MAX_IN_FLIGHT = 8;
+
+type ChunkOutcome = { result: JudgmentResult } | { cause: string };
+
+async function judgeChunk(
 	ctx: JudgeContext,
 	state: Record<string, string>,
 	questions: Questions,
 	signal: AbortSignal,
-): Promise<JudgmentResult | undefined> {
+): Promise<ChunkOutcome> {
 	try {
 		signal.throwIfAborted();
 		const result = await invokeJudge(state, questions, ctx, signal);
 		requireAnswers(questions, result.answers);
-		return result;
+		return { result };
 	} catch (err) {
-		notifyUI(ctx, `review skipped: ${err instanceof Error ? err.message : String(err)}`, "warning");
-		return undefined;
+		return { cause: err instanceof Error ? err.message : String(err) };
 	}
 }
 
-async function judgeScored(
-	route: Route,
+async function judgeChunks(
 	ctx: JudgeContext,
-	state: Record<string, string>,
+	states: readonly Record<string, string>[],
 	questions: Questions,
 	signal: AbortSignal,
-): Promise<{ verdict: Verdict; scorecard: string } | undefined> {
-	const result = await runJudge(ctx, state, questions, signal);
-	if (!result) return undefined;
-	return {
-		verdict: deriveVerdict(route, result.answers),
-		scorecard: renderScorecard(route, result.answers, result.model),
+): Promise<ChunkOutcome[]> {
+	const outcomes: ChunkOutcome[] = [];
+	let next = 0;
+	const worker = async (): Promise<void> => {
+		while (next < states.length) {
+			const index = next++;
+			outcomes[index] = await judgeChunk(ctx, states[index], questions, signal);
+		}
 	};
+	const workers = Math.min(JUDGE_MAX_IN_FLIGHT, states.length);
+	await Promise.all(Array.from({ length: workers }, worker));
+	return outcomes;
+}
+
+async function judgeRoute(
+	route: Route,
+	ctx: JudgeContext,
+	states: readonly Record<string, string>[],
+	questions: Questions,
+	completenessJudged: boolean,
+	signal: AbortSignal,
+): Promise<{ verdict: Verdict; scorecard: string } | undefined> {
+	const outcomes = await judgeChunks(ctx, states, questions, signal);
+	const results: ChunkResult[] = outcomes.map((outcome) =>
+		"result" in outcome
+			? { answers: outcome.result.answers, model: outcome.result.model }
+			: { cause: outcome.cause },
+	);
+	const verdict = combineVerdicts(
+		outcomes.map((outcome) =>
+			"result" in outcome ? deriveVerdict(route, outcome.result.answers) : undefined,
+		),
+	);
+	if (!verdict) {
+		const failed = outcomes.find(
+			(outcome): outcome is { cause: string } => "cause" in outcome,
+		);
+		if (failed) notifyUI(ctx, `review skipped: ${failed.cause}`, "warning");
+		return undefined;
+	}
+	return { verdict, scorecard: renderScorecard(route, results, completenessJudged) };
+}
+
+function partStates(
+	chunks: readonly string[],
+	key: "subject" | "command",
+	before: Record<string, string>,
+	after: Record<string, string>,
+): Record<string, string>[] {
+	return chunks.map((chunk, index) => {
+		const state: Record<string, string> = { ...before, [key]: chunk, ...after };
+		if (chunks.length > 1) state.part = `${index + 1} of ${chunks.length}`;
+		return state;
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -689,51 +862,39 @@ export function handlerDeadline(
 // Content extraction (oh-my-pi tool_result / message shapes -> text)
 // ---------------------------------------------------------------------------
 
-function partText(part: unknown, capEach: number): string {
-	if (typeof part === "string") return part.slice(0, capEach);
+function partText(part: unknown): string {
+	if (typeof part === "string") return part;
 	if (part === null || typeof part !== "object") return "";
 	if (getProp(part, "type") === "image") return "";
 	const text = getProp(part, "text");
-	if (typeof text === "string") return text.slice(0, capEach);
+	if (typeof text === "string") return text;
 	const inner = getProp(part, "content");
-	if (typeof inner === "string") return inner.slice(0, capEach);
-	if (Array.isArray(inner)) return inner.map((p) => partText(p, capEach)).join("");
+	if (typeof inner === "string") return inner;
+	if (Array.isArray(inner)) return inner.map((p) => partText(p)).join("");
 	const output = getProp(part, "output");
-	if (typeof output === "string") return output.slice(0, capEach);
+	if (typeof output === "string") return output;
 	return "";
 }
 
-function textOf(content: unknown, capEach = 8000): string {
-	if (typeof content === "string") return content.slice(0, capEach);
+function textOf(content: unknown): string {
+	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
 	return content
-		.map((c) => partText(c, capEach))
+		.map((c) => partText(c))
 		.filter((s) => s.length > 0)
 		.join("\n");
 }
 
-/** Render an AgentMessage[] (duck-typed) into a transcript, tail-capped at 500K. */
 export function renderTranscript(messages: readonly unknown[]): string {
-	const CAP = 500_000;
-	const tail: string[] = [];
-	let total = 0;
-	// Walk newest-first and stop once the cap is reached, so a long session never
-	// materializes the whole transcript before slicing. Counting only block length
-	// (ignoring the joining separators) guarantees we never under-collect the tail.
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const message = messages[i];
+	const blocks: string[] = [];
+	for (const message of messages) {
 		const roleValue = getProp(message, "role");
 		const role = typeof roleValue === "string" ? roleValue : "?";
-		const body = textOf(getProp(message, "content"), 8000);
+		const body = textOf(getProp(message, "content"));
 		if (!body.trim()) continue;
-		const block = `[${role}] ${body}`;
-		tail.push(block);
-		total += block.length;
-		if (total >= CAP) break;
+		blocks.push(`[${role}] ${body}`);
 	}
-	tail.reverse();
-	const joined = tail.join("\n\n");
-	return joined.length > CAP ? joined.slice(joined.length - CAP) : joined;
+	return blocks.join("\n\n");
 }
 
 /** Resolve the review target (display path, state keys, raw snippet) from a code-change result. Sync, pure. */
@@ -929,16 +1090,17 @@ export default function codexReflector(pi: ExtensionAPI): void {
 			const ev = resolveDeviceWrite(event);
 			if (!ev) return undefined;
 			if (ev.isError || !isCodeChangeTool(ev.toolName)) return undefined;
-			deadline = handlerDeadline();
 			const { filePath, rawSnippet } = resolveChangeTarget(ev);
-			const state: Record<string, string> = {
-				file: fitState(redact(filePath)),
-				subject: fitState(redact(rawSnippet)),
-			};
+			const subject = redact(rawSnippet);
 			const request = pickString(ev.input, ["instruction", "instructions"], "");
-			if (request) state.request = fitState(redact(request));
-			const questions = buildQuestions("write", filePath);
-			const judged = await judgeScored("write", ctx, state, questions, deadline.signal);
+			const requestText = request ? redact(request) : "";
+			const fitsTogether = utf8Length(subject) + utf8Length(requestText) <= CHUNK_MAX_BYTES;
+			const chunks = fitsTogether ? [subject] : chunkText(subject);
+			const requestState: Record<string, string> = fitsTogether && requestText ? { request: requestText } : {};
+			const states = partStates(chunks, "subject", { file: redact(filePath) }, requestState);
+			const questions = buildQuestions("write", filePath, fitsTogether);
+			deadline = handlerDeadline();
+			const judged = await judgeRoute("write", ctx, states, questions, fitsTogether, deadline.signal);
 			if (!judged) return undefined;
 			notifyUI(ctx, `Reflector Review ${judged.verdict} [${filePath}]`, judged.verdict === "FAIL" ? "warning" : "info");
 			return codeReviewResponse(judged.verdict, filePath, judged.scorecard, ev.content);
@@ -959,27 +1121,35 @@ export default function codexReflector(pi: ExtensionAPI): void {
 			if (typeof command !== "string" || !command) return undefined;
 			if (!bashGuardPrescreen(command)) return undefined; // benign: zero judge cost
 			const cwd = ctx.cwd || process.cwd();
+			const states = partStates(chunkText(redact(command)), "command", {}, { cwd: redact(cwd) });
 			deadline = handlerDeadline();
-			const signal = deadline.signal;
-			const state = { command: fitState(redact(command)), cwd: fitState(redact(cwd)) };
-			const result = await runJudge(ctx, state, BASH_GUARD_QUESTIONS, signal);
-			if (!result) return undefined;
+			const outcomes = await judgeChunks(ctx, states, BASH_GUARD_QUESTIONS, deadline.signal);
 			let worstId = "";
 			let worstText = "";
 			let worst = -1;
-			for (const category of BASH_GUARD_CATEGORIES) {
-				const value = noulValue(result.answers[category.id]);
-				if (value > worst) {
-					worst = value;
-					worstId = category.id;
-					worstText = category.text;
+			let worstModel = "";
+			for (const outcome of outcomes) {
+				if (!("result" in outcome)) continue;
+				for (const category of BASH_GUARD_CATEGORIES) {
+					const value = noulValue(outcome.result.answers[category.id]);
+					if (value > worst) {
+						worst = value;
+						worstId = category.id;
+						worstText = category.text;
+						worstModel = outcome.result.model;
+					}
 				}
 			}
-			debug(`bash guard worst ${worstId} P=${worst.toFixed(2)} by ${result.model}`);
-			const decision = bashGuardDecision(worst, worstText, result.model);
-			if (!decision) return undefined;
-			notifyUI(ctx, "Reflector Bash Guard FAIL: command blocked.", "warning");
-			return decision;
+			if (worst >= BLOCK_AT) {
+				debug(`bash guard worst ${worstId} P=${worst.toFixed(2)} by ${worstModel}`);
+				notifyUI(ctx, "Reflector Bash Guard FAIL: command blocked.", "warning");
+				return bashGuardDecision(worst, worstText, worstModel);
+			}
+			const failed = outcomes.find(
+				(outcome): outcome is { cause: string } => "cause" in outcome,
+			);
+			if (failed) notifyUI(ctx, `review skipped: ${failed.cause}`, "warning");
+			return undefined;
 		} catch (err) {
 			debug(`tool_call guard error: ${String(err)}`);
 			return undefined;
@@ -1000,14 +1170,17 @@ export default function codexReflector(pi: ExtensionAPI): void {
 			// the contract explicit if that drifts. The Esc-after-message_end race emits
 			// stopReason "stop" with no abort signal — upstream issue, not observable here.
 			if (settledStopReason(event) === "aborted") return undefined;
+			const lastMessage = getProp(event, "last_assistant_message");
+			const lastText = textOf(getProp(lastMessage, "content"));
 			const messages = getProp(event, "messages");
-			const transcript = renderTranscript(Array.isArray(messages) ? messages : []);
-			if (!transcript) return undefined;
+			const subject = lastText || renderTranscript(Array.isArray(messages) ? messages : []);
+			if (!subject) return undefined;
+			const chunks = chunkText(redact(subject));
+			const states = partStates(chunks, "subject", {}, {});
+			const oneChunk = chunks.length === 1;
+			const questions = buildQuestions("stop", undefined, oneChunk);
 			deadline = handlerDeadline();
-			const signal = deadline.signal;
-			const state = { subject: fitState(redact(transcript)) };
-			const questions = buildQuestions("stop");
-			const judged = await judgeScored("stop", ctx, state, questions, signal);
+			const judged = await judgeRoute("stop", ctx, states, questions, oneChunk, deadline.signal);
 			if (!judged) return undefined;
 			// PASS / UNCERTAIN settle; only a FAIL blocks. Settle SILENTLY: surfacing the
 			// verdict via pi.sendMessage re-enters the conversation (even with triggerTurn:false),
