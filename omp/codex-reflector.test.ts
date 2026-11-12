@@ -1,124 +1,147 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
+import type { Answer, JudgmentResult } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ToolResultEvent } from "@oh-my-pi/pi-coding-agent";
 
 import codexReflector, {
+	BASH_GUARD_QUESTIONS,
 	bashGuardDecision,
 	bashGuardPrescreen,
-	changeSizeHeuristics,
-	classify,
+	buildQuestions,
 	codeReviewResponse,
-	fileHeuristics,
-	gateModelEffort,
+	DIMENSIONS,
+	deriveVerdict,
+	fitState,
 	handlerDeadline,
 	HANDLER_BUDGET_MS,
+	isCodeChangeTool,
 	notifyUI,
-	parseVerdict,
 	redact,
+	renderScorecard,
 	renderTranscript,
 	resolveChangeTarget,
 	resolveDeviceWrite,
-	sandboxContent,
+	type Route,
+	SCREENS,
+	STATE_MAX_CHARS,
 	stopReviewDecision,
 	testSetHandlerBudgetMs,
+	testSetJudge,
+	UI_DIMENSIONS,
 } from "./codex-reflector.ts";
 
-/** Poll until `pid` no longer exists (kill(pid,0) → ESRCH), bounded by timeoutMs.
- *  invokeCodex resolves on abort before the child's close event fires, so a
- *  SIGKILLed child may briefly linger; poll rather than checking once. */
-async function waitForPidGone(pid: number, timeoutMs: number): Promise<boolean> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		try {
-			process.kill(pid, 0);
-		} catch {
-			return true; // ESRCH — process is gone
-		}
-		await Bun.sleep(25);
-	}
-	return false;
+// ---------------------------------------------------------------------------
+// Judge fakes: answers drive every verdict-route test through testSetJudge.
+// ---------------------------------------------------------------------------
+
+interface ContentResult {
+	content?: Array<{ type: string; text: string }>;
+	isError?: boolean;
 }
 
-describe("parseVerdict", () => {
-	const cases: ReadonlyArray<[string, "PASS" | "FAIL" | "UNCERTAIN"]> = [
-		["PASS", "PASS"],
-		["FAILED: missing null check", "FAIL"],
-		["verdict: pass", "PASS"],
-		["verdict=FAIL", "FAIL"],
-		["**PASS**", "PASS"],
-		["✅ PASS", "PASS"],
-		["❌ FAIL", "FAIL"],
-		["LGTM", "PASS"],
-		["REJECTED", "FAIL"],
-		["PASS\nFAIL", "UNCERTAIN"], // contradictory
-		["", "UNCERTAIN"],
-		["random text\nno verdict here", "UNCERTAIN"],
-		["l1\nl2\nl3\nl4\nl5\nPASS", "UNCERTAIN"], // verdict buried past the 5-line window
-	];
-	for (const [raw, expected] of cases) {
-		test(`${JSON.stringify(raw)} -> ${expected}`, () => {
-			expect(parseVerdict(raw)).toBe(expected);
-		});
-	}
-});
+interface StopResult {
+	decision?: string;
+	reason?: string;
+}
 
-describe("classify", () => {
-	test("native mutators -> code_change", () => {
-		expect(classify("write", false)?.category).toBe("code_change");
-		expect(classify("edit", false)?.category).toBe("code_change");
-		expect(classify("ast_edit", false)?.category).toBe("code_change");
-		expect(classify("fast_edit", false)?.category).toBe("code_change");
+interface GuardResult {
+	block?: boolean;
+	reason?: string;
+}
+
+interface Notice {
+	msg: string;
+	level: string;
+}
+
+const USAGE = {
+	input: 10,
+	output: 10,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 20,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+function scoreAnswer(probabilities: Record<string, number>): Answer {
+	return { type: "score", score: 0, probabilities, confidence: 1 };
+}
+
+function noulAnswer(value: number): Answer {
+	return { type: "noul", noul: value };
+}
+
+const CLEAN = { "0": 0.05, "1": 0.05, "2": 0.9 };
+const DIMENSION_IDS = DIMENSIONS.map((d) => d.id);
+
+function dimensionAnswers(overrides: Record<string, Answer> = {}): Record<string, Answer> {
+	const answers: Record<string, Answer> = {};
+	for (const id of DIMENSION_IDS) answers[id] = scoreAnswer(CLEAN);
+	return { ...answers, ...overrides };
+}
+
+function writeAnswers(overrides: Record<string, Answer> = {}): Record<string, Answer> {
+	return {
+		is_executable_code: noulAnswer(0.9),
+		touches_shared_state: noulAnswer(0.9),
+		has_placeholder: noulAnswer(0),
+		...dimensionAnswers(overrides),
+	};
+}
+
+function judgeResult(answers: Record<string, Answer>, model = "jev-1.14.0"): JudgmentResult {
+	return { api: "typesafe", provider: "typesafe", model, answers, usage: USAGE };
+}
+
+function notifyingCtx(): { ctx: Record<string, unknown>; notices: Notice[] } {
+	const notices: Notice[] = [];
+	const ctx = {
+		cwd: ".",
+		hasUI: true,
+		ui: {
+			notify(msg: string, level?: string): void {
+				notices.push({ msg, level: level ?? "info" });
+			},
+		},
+		modelRegistry: {},
+	};
+	return { ctx, notices };
+}
+
+describe("isCodeChangeTool", () => {
+	test("native mutators -> true", () => {
+		expect(isCodeChangeTool("write")).toBe(true);
+		expect(isCodeChangeTool("edit")).toBe(true);
+		expect(isCodeChangeTool("ast_edit")).toBe(true);
+		expect(isCodeChangeTool("fast_edit")).toBe(true);
 	});
-	test("bash failure -> bash_failure, bash success -> null", () => {
-		expect(classify("bash", true)?.category).toBe("bash_failure");
-		expect(classify("bash", false)).toBeNull();
+	test("non-reviewed tools -> false", () => {
+		expect(isCodeChangeTool("read")).toBe(false);
+		expect(isCodeChangeTool("task")).toBe(false);
+		expect(isCodeChangeTool("search")).toBe(false);
+		expect(isCodeChangeTool("bash")).toBe(false);
 	});
-	test("non-reviewed tools -> null", () => {
-		expect(classify("read", false)).toBeNull();
-		expect(classify("task", false)).toBeNull();
-		expect(classify("search", false)).toBeNull();
+	test("thinking MCP -> false", () => {
+		expect(isCodeChangeTool("mcp__sequential__sequentialthinking")).toBe(false);
+		expect(isCodeChangeTool("mcp__shannon__shannon")).toBe(false);
 	});
-	test("thinking MCP -> thinking", () => {
-		expect(classify("mcp__sequential__sequentialthinking", false)?.category).toBe("thinking");
-		expect(classify("mcp__shannon__shannon", false)?.category).toBe("thinking");
+	test("Fast-Apply MCP edit -> true", () => {
+		expect(isCodeChangeTool("mcp__morph__edit_file")).toBe(true);
+		expect(isCodeChangeTool("mcp__morphllm__edit_file")).toBe(true);
 	});
-	test("Fast-Apply MCP success -> code_change", () => {
-		expect(classify("mcp__morph__edit_file", false)?.category).toBe("code_change");
-		expect(classify("mcp__morphllm__edit_file", false)?.category).toBe("code_change");
+	test("non-edit Morph MCP tools -> false (fastcompact is not an edit)", () => {
+		expect(isCodeChangeTool("mcp__morph__fastcompact")).toBe(false);
+		expect(isCodeChangeTool("mcp__morph__warpgrep")).toBe(false);
+		expect(isCodeChangeTool("mcp__morph__flashcompact")).toBe(false);
 	});
-	test("non-edit Morph MCP tools -> null (fastcompact is not an edit)", () => {
-		expect(classify("mcp__morph__fastcompact", false)).toBeNull();
-		expect(classify("mcp__morph__warpgrep", false)).toBeNull();
-		expect(classify("mcp__morph__flashcompact", false)).toBeNull();
-	});
-	test("native read-only Morph plugin tools -> null (unrouted by design)", () => {
-		expect(classify("fastcompact", false)).toBeNull();
-		expect(classify("flashcompact", false)).toBeNull();
-		expect(classify("codebase_warpsearch", false)).toBeNull();
-		expect(classify("github_warpsearch", false)).toBeNull();
-	});
-	test("Fast-Apply MCP failure WITH Morph payload -> code_change_failure", () => {
-		expect(
-			classify("mcp__morph__edit_file", true, { code_edit: "x", instruction: "y" })?.category,
-		).toBe("code_change_failure");
-	});
-	test("native fast_edit failure WITH Morph payload -> code_change_failure", () => {
-		expect(
-			classify("fast_edit", true, { code_edit: "x", instructions: "y" })?.category,
-		).toBe("code_change_failure");
-	});
-	test("native fast_edit failure WITHOUT complete payload -> null", () => {
-		expect(classify("fast_edit", true)).toBeNull();
-		expect(classify("fast_edit", true, { code_edit: "x" })).toBeNull();
-	});
-	test("Fast-Apply MCP failure WITHOUT payload -> null (name match alone is insufficient)", () => {
-		expect(classify("mcp__morph__edit_file", true)).toBeNull();
-		expect(classify("mcp__morph__edit_file", true, { code_edit: "", instruction: "" })).toBeNull();
-		expect(classify("mcp__morph__edit_file", true, { code_edit: "x" })).toBeNull();
+	test("native read-only Morph plugin tools -> false (unrouted by design)", () => {
+		expect(isCodeChangeTool("fastcompact")).toBe(false);
+		expect(isCodeChangeTool("flashcompact")).toBe(false);
+		expect(isCodeChangeTool("codebase_warpsearch")).toBe(false);
+		expect(isCodeChangeTool("github_warpsearch")).toBe(false);
 	});
 });
 
@@ -142,85 +165,232 @@ describe("redact", () => {
 	});
 });
 
-describe("fileHeuristics", () => {
-	test("security-sensitive paths", () => {
-		expect(fileHeuristics(".env.local")[0]).toContain("SECURITY-SENSITIVE");
+describe("deriveVerdict", () => {
+	test("a 0.7 defect is FAIL on write, just below is UNCERTAIN", () => {
+		const at = writeAnswers({ correctness: scoreAnswer({ "0": 0.7, "1": 0.2, "2": 0.1 }) });
+		expect(deriveVerdict("write", at)).toBe("FAIL");
+		const below = writeAnswers({ correctness: scoreAnswer({ "0": 0.6999, "1": 0.2, "2": 0.1001 }) });
+		expect(deriveVerdict("write", below)).toBe("UNCERTAIN");
 	});
-	test("test / ui / data / config classification", () => {
-		expect(fileHeuristics("foo_test.ts").some((f) => f.startsWith("TEST FILE"))).toBe(true);
-		expect(fileHeuristics("page.tsx").some((f) => f.startsWith("UI FILE"))).toBe(true);
-		expect(fileHeuristics("schema.sql").some((f) => f.startsWith("DATA FILE"))).toBe(true);
-		expect(fileHeuristics("app.config.json").some((f) => f.startsWith("CONFIG FILE"))).toBe(true);
+	test("a 0.3 defect is UNCERTAIN, just below is PASS", () => {
+		const at = writeAnswers({ correctness: scoreAnswer({ "0": 0.3, "1": 0.1, "2": 0.6 }) });
+		expect(deriveVerdict("write", at)).toBe("UNCERTAIN");
+		const below = writeAnswers({ correctness: scoreAnswer({ "0": 0.2999, "1": 0.0001, "2": 0.7 }) });
+		expect(deriveVerdict("write", below)).toBe("PASS");
 	});
-	test("plain source path has no focuses", () => {
-		expect(fileHeuristics("src/util.ts")).toHaveLength(0);
+	test("Stop fails at a 0.9 defect, just below does not", () => {
+		const at = dimensionAnswers({ correctness: scoreAnswer({ "0": 0.9, "1": 0.05, "2": 0.05 }) });
+		expect(deriveVerdict("stop", at)).toBe("FAIL");
+		const below = dimensionAnswers({ correctness: scoreAnswer({ "0": 0.8999, "1": 0.05, "2": 0.0501 }) });
+		expect(deriveVerdict("stop", below)).toBe("UNCERTAIN");
+	});
+	test("plan fails at a 0.7 defect like write", () => {
+		const at = dimensionAnswers({ design: scoreAnswer({ "0": 0.7, "1": 0.2, "2": 0.1 }) });
+		expect(deriveVerdict("plan", at)).toBe("FAIL");
+	});
+	test("a level-1-heavy dimension among clean ones yields UNCERTAIN (amendment case 1)", () => {
+		const answers = writeAnswers({ correctness: scoreAnswer({ "0": 0.05, "1": 0.93, "2": 0.02 }) });
+		expect(deriveVerdict("write", answers)).toBe("UNCERTAIN");
+	});
+	test("the same probabilities on a screen-dropped dimension still yield PASS (amendment case 2)", () => {
+		const answers = writeAnswers({
+			performance: scoreAnswer({ "0": 0.05, "1": 0.93, "2": 0.02 }),
+			is_executable_code: noulAnswer(0.4),
+		});
+		expect(deriveVerdict("write", answers)).toBe("PASS");
+	});
+	test("a tie between level 1 and level 2 yields UNCERTAIN (amendment case 3)", () => {
+		const answers = writeAnswers({ correctness: scoreAnswer({ "0": 0.05, "1": 0.475, "2": 0.475 }) });
+		expect(deriveVerdict("write", answers)).toBe("UNCERTAIN");
+	});
+	test("the same level-1 case on stop does not fail (amendment case 4)", () => {
+		const answers = dimensionAnswers({ correctness: scoreAnswer({ "0": 0.05, "1": 0.93, "2": 0.02 }) });
+		const verdict = deriveVerdict("stop", answers);
+		expect(verdict).not.toBe("FAIL");
+		expect(stopReviewDecision(verdict, "scorecard")).toBeUndefined();
+	});
+	test("is_executable_code below 0.5 drops correctness, complexity, concurrency, and performance", () => {
+		const defective = scoreAnswer({ "0": 0.95, "1": 0.03, "2": 0.02 });
+		const dropped = writeAnswers({
+			is_executable_code: noulAnswer(0.4),
+			correctness: defective,
+			complexity: defective,
+			concurrency: defective,
+			performance: defective,
+		});
+		expect(deriveVerdict("write", dropped)).toBe("PASS");
+		expect(deriveVerdict("write", { ...dropped, is_executable_code: noulAnswer(0.6) })).toBe("FAIL");
+	});
+	test("touches_shared_state below 0.5 drops concurrency", () => {
+		const dropped = writeAnswers({
+			touches_shared_state: noulAnswer(0.4),
+			concurrency: scoreAnswer({ "0": 0.95, "1": 0.03, "2": 0.02 }),
+		});
+		expect(deriveVerdict("write", dropped)).toBe("PASS");
+		expect(deriveVerdict("write", { ...dropped, touches_shared_state: noulAnswer(0.6) })).toBe("FAIL");
+	});
+	test("has_placeholder raises the spec_completion defect to at least its own value", () => {
+		expect(deriveVerdict("write", writeAnswers({ has_placeholder: noulAnswer(0.75) }))).toBe("FAIL");
+		expect(
+			deriveVerdict(
+				"write",
+				writeAnswers({
+					has_placeholder: noulAnswer(0.4),
+					spec_completion: scoreAnswer({ "0": 0.55, "1": 0.25, "2": 0.2 }),
+				}),
+			),
+		).toBe("UNCERTAIN");
 	});
 });
 
-describe("changeSizeHeuristics", () => {
-	test("large content", () => {
-		const hints = changeSizeHeuristics(6000);
-		expect(hints).toHaveLength(1);
-		expect(hints[0]).toContain("LARGE CONTENT");
+describe("buildQuestions", () => {
+	const SEVEN = DIMENSIONS.map((d) => d.id);
+	const UI = UI_DIMENSIONS.map((d) => d.id);
+	const SCREEN_IDS = SCREENS.map((s) => s.id);
+
+	test("write returns exactly the seven dimension ids plus the three screen ids", () => {
+		const ids = Object.keys(buildQuestions("write"));
+		expect(ids).toHaveLength(SEVEN.length + SCREEN_IDS.length);
+		expect([...ids].sort()).toEqual([...SEVEN, ...SCREEN_IDS].sort());
 	});
-	test("expansion when new >> old", () => {
-		expect(changeSizeHeuristics(50, 10, 100)[0]).toContain("SIGNIFICANT EXPANSION");
+	test("a UI file extension adds exactly layout, animation, accessibility", () => {
+		const ids = Object.keys(buildQuestions("write", "page.tsx"));
+		expect(ids).toHaveLength(SEVEN.length + SCREEN_IDS.length + UI.length);
+		expect([...ids].sort()).toEqual([...SEVEN, ...SCREEN_IDS, ...UI].sort());
 	});
-	test("reduction when new << old", () => {
-		expect(changeSizeHeuristics(50, 100, 10)[0]).toContain("SIGNIFICANT REDUCTION");
+	test("a non-UI file does not add UI dimensions", () => {
+		const ids = Object.keys(buildQuestions("write", "src/util.ts"));
+		expect(ids).toHaveLength(SEVEN.length + SCREEN_IDS.length);
+		for (const id of UI) expect(ids).not.toContain(id);
 	});
-	test("no signals for small symmetric change", () => {
-		expect(changeSizeHeuristics(50, 100, 90)).toHaveLength(0);
+	test("every UI extension in the contract set adds the UI dimensions", () => {
+		for (const file of [
+			"a.html",
+			"a.htm",
+			"a.css",
+			"a.scss",
+			"a.sass",
+			"a.less",
+			"a.jsx",
+			"a.tsx",
+			"a.vue",
+			"a.svelte",
+			"a.astro",
+		]) {
+			expect(Object.keys(buildQuestions("write", file))).toHaveLength(
+				SEVEN.length + SCREEN_IDS.length + UI.length,
+			);
+		}
+	});
+	test("plan and stop return exactly the seven dimension ids", () => {
+		expect(Object.keys(buildQuestions("plan"))).toEqual(SEVEN);
+		expect(Object.keys(buildQuestions("stop"))).toEqual(SEVEN);
+	});
+	test("every score question has exactly three criteria", () => {
+		for (const route of ["write", "plan", "stop"] as const) {
+			for (const question of Object.values(buildQuestions(route, "app.css"))) {
+				if (question.type === "score") expect(question.criteria).toHaveLength(3);
+			}
+		}
+	});
+	test("instructions follow the frozen subject template", () => {
+		expect(buildQuestions("stop")["design"]?.instructions).toBe(
+			"Rate the work done in this session in `subject` on design.",
+		);
+		expect(buildQuestions("write", "x.ts")["spec_completion"]?.instructions).toBe(
+			"Rate the code change in `subject` on completeness against its stated job, including the request in `request` when that field is present.",
+		);
+		expect(buildQuestions("plan")["correctness"]?.instructions).toBe(
+			"Rate the implementation plan in `subject` on correctness.",
+		);
 	});
 });
 
-describe("gateModelEffort", () => {
-	test("tiny non-risky snippet -> medium", () => {
-		expect(gateModelEffort("code_change", "src/util.ts", "const x = 1;")).toEqual({
-			model: "gpt-5.6-luna",
-			effort: "medium",
-		});
-	});
-	test("security-sensitive path -> hard (medium)", () => {
-		expect(gateModelEffort("code_change", ".env.local", "X".repeat(300))).toEqual({
-			model: "gpt-5.6-sol",
-			effort: "medium",
-		});
-	});
-	test("large snippet -> hard (medium)", () => {
-		expect(gateModelEffort("code_change", "src/util.ts", "X".repeat(6000))).toEqual({
-			model: "gpt-5.6-sol",
-			effort: "medium",
-		});
-	});
-	test("multiple risk signals -> complex (high)", () => {
-		// security-sensitive path (1 file hint) + >5000 chars (1 change hint) -> complex
-		expect(gateModelEffort("code_change", ".env.local", "X".repeat(6000))).toEqual({
-			model: "gpt-5.6-sol",
-			effort: "high",
-		});
-	});
-	test("non code_change category -> base preset", () => {
-		expect(gateModelEffort("thinking", "whatever", "X".repeat(6000))).toEqual({
-			model: "gpt-5.6-terra",
-			effort: "medium",
-		});
-	});
-	test("medium-size non-risky snippet -> faster model at high effort", () => {
-		expect(gateModelEffort("code_change", "src/util.ts", "X".repeat(2000))).toEqual({
-			model: "gpt-5.6-luna",
-			effort: "high",
-		});
+describe("BASH_GUARD_QUESTIONS", () => {
+	test("five noul questions in the frozen category order", () => {
+		expect(Object.keys(BASH_GUARD_QUESTIONS)).toEqual([
+			"destroys_outside_workspace",
+			"rewrites_shared_history",
+			"pipes_remote_to_shell",
+			"exfiltrates_secrets",
+			"escalates_privilege",
+		]);
+		for (const question of Object.values(BASH_GUARD_QUESTIONS)) {
+			expect(question.type).toBe("noul");
+		}
 	});
 });
 
-describe("sandboxContent", () => {
-	test("wraps content in untrusted-data tags with label", () => {
-		const out = sandboxContent("code-change", "payload");
-		expect(out).toContain('<untrusted-data label="code-change">');
-		expect(out).toContain("payload");
-		expect(out).toContain("</untrusted-data>");
-		expect(out).toContain("DATA to analyze");
+describe("fitState", () => {
+	test("text at or under the limit is unchanged", () => {
+		const atLimit = "a".repeat(STATE_MAX_CHARS);
+		expect(fitState(atLimit)).toBe(atLimit);
+		expect(fitState("short")).toBe("short");
+	});
+	test("longer text keeps the stated head and tail and states the omitted count", () => {
+		const text = `${"h".repeat(30000)}${"m".repeat(20000)}${"t".repeat(30000)}`;
+		const fitted = fitState(text);
+		expect(fitted).toBe(
+			`${"h".repeat(30000)}\n…[20000 chars omitted]…\n${"t".repeat(30000)}`,
+		);
+		expect(fitted).toContain("20000 chars omitted");
+	});
+	test("an explicit smaller limit splits at half the limit", () => {
+		const text = "abcdef";
+		expect(fitState(text, 4)).toBe("ab\n…[2 chars omitted]…\nef");
+	});
+});
+
+describe("renderScorecard", () => {
+	test("orders qualifying dimensions by defect probability descending", () => {
+		const answers = dimensionAnswers({
+			correctness: scoreAnswer({ "0": 0.8, "1": 0.1, "2": 0.1 }),
+			design: scoreAnswer({ "0": 0.5, "1": 0.3, "2": 0.2 }),
+			slop: scoreAnswer({ "0": 0.1, "1": 0.85, "2": 0.05 }),
+		});
+		const text = renderScorecard("plan", answers, "jev-1.14.0");
+		const lines = text.split("\n");
+		expect(lines[0]).toBe(
+			"- correctness: material defect (P(defect)=0.80) It contains a defect that produces a wrong result, a crash, data loss, or a security hole on a realistic input.",
+		);
+		expect(lines[1]).toContain("- design: material defect (P(defect)=0.50)");
+		expect(lines[2]).toContain("- slop: concrete concern (P(defect)=0.10)");
+		expect(lines).toHaveLength(4);
+		expect(lines[3]).toBe("Judged by jev-1.14.0.");
+		expect(text).not.toContain("spec_completion");
+	});
+	test("falls back to the no-defect line when nothing qualifies", () => {
+		const text = renderScorecard("plan", dimensionAnswers(), "jev-1.14.0");
+		expect(text).toBe("No dimension shows a material defect (highest P(defect)=0.05).\nJudged by jev-1.14.0.");
+	});
+	test("a placeholder-raised spec_completion reads as a material defect with the level-0 criterion", () => {
+		const text = renderScorecard("write", writeAnswers({ has_placeholder: noulAnswer(0.9) }), "jev-1.14.0");
+		expect(text).toContain(
+			"- spec_completion: material defect (P(defect)=0.90) A required part is missing, stubbed, or left as a placeholder, so it does not do its stated job.",
+		);
+	});
+	test("a 0.35 defect with a no-concern majority reads as a concrete concern", () => {
+		const answers = dimensionAnswers({ design: scoreAnswer({ "0": 0.35, "1": 0.05, "2": 0.6 }) });
+		const text = renderScorecard("plan", answers, "jev-1.14.0");
+		expect(text).toContain(
+			"- design: concrete concern (P(defect)=0.35) It works within the structure but leaks an internal detail, duplicates an existing mechanism, or names something misleadingly.",
+		);
+	});
+	test("a 0.10 defect with a level-1 majority still reads as a concrete concern", () => {
+		const answers = dimensionAnswers({ slop: scoreAnswer({ "0": 0.1, "1": 0.85, "2": 0.05 }) });
+		const text = renderScorecard("plan", answers, "jev-1.14.0");
+		expect(text).toContain(
+			"- slop: concrete concern (P(defect)=0.10) It contains one or two small leftovers, such as an unused import, a stale comment, or a vague name.",
+		);
+	});
+	test("carries the judge model line", () => {
+		const text = renderScorecard(
+			"stop",
+			dimensionAnswers({ correctness: scoreAnswer({ "0": 0.9, "1": 0.05, "2": 0.05 }) }),
+			"jev-1.14.0",
+		);
+		expect(text.split("\n").at(-1)).toBe("Judged by jev-1.14.0.");
+		expect(text).toContain("- correctness: material defect (P(defect)=0.90)");
 	});
 });
 
@@ -257,78 +427,143 @@ describe("factory", () => {
 			},
 			logger: { debug() {}, info() {} },
 		};
-		return { pi: stub as unknown as ExtensionAPI, events, handlers, sendMessageCalls, flags, flagValues };
+		return { pi: stub as ExtensionAPI, events, handlers, sendMessageCalls, flags, flagValues };
 	}
 
-	test("registers the four lifecycle handlers", () => {
+	function writeEvent(content = "const a = 1;"): Record<string, unknown> {
+		return {
+			type: "tool_result",
+			toolName: "write",
+			toolCallId: "id",
+			input: { path: "x.ts", content },
+			content: [],
+			isError: false,
+		};
+	}
+
+	function stopEvent(stopHookActive = false): Record<string, unknown> {
+		return {
+			type: "session_stop",
+			messages: [
+				{ role: "user", content: "hi" },
+				{ role: "assistant", content: "did work" },
+			],
+			turn_id: 1,
+			session_id: "s",
+			stop_hook_active: stopHookActive,
+		};
+	}
+
+	function bashEvent(command: string): Record<string, unknown> {
+		return { type: "tool_call", toolName: "bash", toolCallId: "id", input: { command } };
+	}
+
+	function setEnv(name: string, value: string | undefined): () => void {
+		const prev = process.env[name];
+		if (value === undefined) delete process.env[name];
+		else process.env[name] = value;
+		return () => {
+			if (prev === undefined) delete process.env[name];
+			else process.env[name] = prev;
+		};
+	}
+
+	let restoreEnabled: (() => void) | undefined;
+	beforeEach(() => {
+		restoreEnabled = setEnv("CODEX_REFLECTOR_ENABLED", undefined);
+	});
+	afterEach(() => {
+		restoreEnabled?.();
+	});
+
+	test("registers the three lifecycle handlers", () => {
 		const { pi, events } = makePi();
 		codexReflector(pi);
-		expect(new Set(events)).toEqual(
-			new Set(["tool_result", "tool_call", "session_stop", "session_before_compact"]),
-		);
+		expect([...events].sort()).toEqual(["session_stop", "tool_call", "tool_result"].sort());
+	});
+
+	test("a write to a UI file asks the layout, animation, and accessibility questions", async () => {
+		let asked: string[] = [];
+		testSetJudge(async (_state, questions) => {
+			asked = Object.keys(questions);
+			return judgeResult(
+				writeAnswers({
+					layout: scoreAnswer(CLEAN),
+					animation: scoreAnswer(CLEAN),
+					accessibility: scoreAnswer(CLEAN),
+				}),
+			);
+		});
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const event = { ...writeEvent("<div />"), input: { path: "src/Page.TSX", content: "<div />" } };
+			await handlers.get("tool_result")?.(event, notifyingCtx().ctx);
+			expect(asked).toEqual(expect.arrayContaining(["layout", "animation", "accessibility"]));
+		} finally {
+			testSetJudge(undefined);
+		}
 	});
 
 	test("kill switch (CODEX_REFLECTOR_ENABLED=0) registers nothing", () => {
-		const prev = process.env.CODEX_REFLECTOR_ENABLED;
-		process.env.CODEX_REFLECTOR_ENABLED = "0";
+		const restore = setEnv("CODEX_REFLECTOR_ENABLED", "0");
 		try {
 			const { pi, events } = makePi();
 			codexReflector(pi);
 			expect(events).toHaveLength(0);
 		} finally {
-			if (prev === undefined) delete process.env.CODEX_REFLECTOR_ENABLED;
-			else process.env.CODEX_REFLECTOR_ENABLED = prev;
+			restore();
 		}
 	});
+
 	test("session_stop is disabled by default (opt-in)", async () => {
-		const prevStopReview = process.env.CODEX_REFLECTOR_STOP_REVIEW;
-		delete process.env.CODEX_REFLECTOR_STOP_REVIEW;
+		const restore = setEnv("CODEX_REFLECTOR_STOP_REVIEW", undefined);
+		let judgeCalls = 0;
+		testSetJudge(async () => {
+			judgeCalls++;
+			return judgeResult(dimensionAnswers());
+		});
 		try {
 			const { pi, handlers } = makePi();
 			codexReflector(pi);
 			const handler = handlers.get("session_stop");
 			expect(handler).toBeDefined();
-			const result = await handler?.(
-				{
-					type: "session_stop",
-					messages: [
-						{ role: "user", content: "hi" },
-						{ role: "assistant", content: "did work" },
-					],
-					turn_id: 1,
-					session_id: "s",
-					stop_hook_active: false,
-				},
-				{ cwd: ".", hasUI: false, ui: { notify() {} } },
-			);
+			const { ctx } = notifyingCtx();
+			const result = await handler?.(stopEvent(), ctx);
 			expect(result).toBeUndefined();
+			expect(judgeCalls).toBe(0);
 		} finally {
-			if (prevStopReview !== undefined) process.env.CODEX_REFLECTOR_STOP_REVIEW = prevStopReview;
+			restore();
+			testSetJudge(undefined);
 		}
 	});
 
 	test("session_stop runs when codex-stop-review flag is enabled", async () => {
-		const prevStopReview = process.env.CODEX_REFLECTOR_STOP_REVIEW;
-		delete process.env.CODEX_REFLECTOR_STOP_REVIEW;
+		const restore = setEnv("CODEX_REFLECTOR_STOP_REVIEW", undefined);
+		let judgeCalls = 0;
+		testSetJudge(async () => {
+			judgeCalls++;
+			return judgeResult(dimensionAnswers());
+		});
 		try {
 			const { pi, handlers, flagValues } = makePi();
 			codexReflector(pi);
 			flagValues.set("codex-stop-review", true);
 			const handler = handlers.get("session_stop");
 			expect(handler).toBeDefined();
-			const result = await handler?.(
-				{ type: "session_stop", messages: [], turn_id: 1, session_id: "s", stop_hook_active: false },
-				{ cwd: ".", ui: { notify() {} } },
-			);
+			const { ctx, notices } = notifyingCtx();
+			const result = await handler?.(stopEvent(), ctx);
+			expect(judgeCalls).toBe(1);
 			expect(result).toBeUndefined();
+			expect(notices.some((n) => n.msg.includes("review skipped"))).toBe(false);
 		} finally {
-			if (prevStopReview !== undefined) process.env.CODEX_REFLECTOR_STOP_REVIEW = prevStopReview;
+			restore();
+			testSetJudge(undefined);
 		}
 	});
 
 	test("session_stop settles (undefined) when there is nothing to review", async () => {
-		const prevStopReview = process.env.CODEX_REFLECTOR_STOP_REVIEW;
-		process.env.CODEX_REFLECTOR_STOP_REVIEW = "1";
+		const restore = setEnv("CODEX_REFLECTOR_STOP_REVIEW", "1");
 		try {
 			const { pi, handlers } = makePi();
 			codexReflector(pi);
@@ -340,428 +575,558 @@ describe("factory", () => {
 			);
 			expect(result).toBeUndefined();
 		} finally {
-			if (prevStopReview === undefined) delete process.env.CODEX_REFLECTOR_STOP_REVIEW;
-			else process.env.CODEX_REFLECTOR_STOP_REVIEW = prevStopReview;
+			restore();
 		}
 	});
-	// Stop-review settle contract: a PASS/UNCERTAIN verdict must settle SILENTLY —
-	// return undefined AND inject no conversation message. Injecting it via pi.sendMessage
-	// re-enters the conversation, so the agent takes a turn on it, re-stops, and this
-	// holistic review re-runs, looping the Stop on every PASS up to the harness cap. A FAIL
-	// blocks via the returned decision, never via sendMessage. invokeCodex reads its result
-	// from the `-o <outPath>` file (stdout is ignored), so the fake codex parses -o and
-	// writes the verdict there.
-	const STOP_VERDICTS: ReadonlyArray<{ name: string; out: string; blocks: boolean }> = [
-		{ name: "PASS", out: "PASS", blocks: false },
-		{ name: "UNCERTAIN", out: "still investigating", blocks: false },
-		{ name: "FAIL", out: "FAIL: missing guard", blocks: true },
+
+	// Stop-review settle contract: only a FAIL at BLOCK_AT may return a block decision,
+	// and every settle must stay silent (no pi.sendMessage) — a conversation message
+	// re-enters the agent loop and loops the Stop up to the harness continuation cap.
+	const STOP_CASES: ReadonlyArray<{ name: string; defect: number; blocks: boolean }> = [
+		{ name: "blocks exactly at 0.9", defect: 0.9, blocks: true },
+		{ name: "settles just below 0.9", defect: 0.8999, blocks: false },
+		{ name: "settles on a clean PASS", defect: 0.05, blocks: false },
 	];
-	for (const c of STOP_VERDICTS) {
-		test(`session_stop ${c.name} ${c.blocks ? "blocks via decision" : "settles"} without sendMessage`, async () => {
-			const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
-			writeFileSync(
-				join(binDir, "codex"),
-				`#!/bin/sh\nout=""\nwhile [ $# -gt 0 ]; do\n  case "$1" in\n    -o) out="$2"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[ -n "$out" ] && printf '%s\\n' ${JSON.stringify(c.out)} > "$out"\nexit 0\n`,
-			);
-			chmodSync(join(binDir, "codex"), 0o755);
-			const prevPath = process.env.PATH ?? "";
-			const prevStopReview = process.env.CODEX_REFLECTOR_STOP_REVIEW;
-			process.env.PATH = `${binDir}:${prevPath}`;
-			process.env.CODEX_REFLECTOR_STOP_REVIEW = "1";
+	for (const c of STOP_CASES) {
+		test(`session_stop ${c.name}`, async () => {
+			const restore = setEnv("CODEX_REFLECTOR_STOP_REVIEW", "1");
+			let capturedState: Record<string, string> | undefined;
+			testSetJudge(async (state) => {
+				capturedState = state;
+				return judgeResult(
+					dimensionAnswers({
+						correctness: scoreAnswer({
+							"0": c.defect,
+							"1": (1 - c.defect) / 2,
+							"2": (1 - c.defect) / 2,
+						}),
+					}),
+				);
+			});
 			try {
 				const { pi, handlers, sendMessageCalls } = makePi();
 				codexReflector(pi);
 				const handler = handlers.get("session_stop");
 				expect(handler).toBeDefined();
-				const result = (await handler?.(
-					{
-						type: "session_stop",
-						messages: [
-							{ role: "user", content: "hi" },
-							{ role: "assistant", content: "did work" },
-						],
-						turn_id: 1,
-						session_id: "s",
-						stop_hook_active: false,
-					},
-					{ cwd: ".", hasUI: false, ui: { notify() {} } },
-				)) as { decision?: string; reason?: string } | undefined;
+				const { ctx, notices } = notifyingCtx();
+				const result = (await handler?.(stopEvent(), ctx)) as StopResult | undefined;
+				expect(Object.keys(capturedState ?? {})).toEqual(["subject"]);
 				if (c.blocks) {
 					expect(result?.decision).toBe("block");
-					expect(result?.reason).toContain("FAIL");
+					expect(result?.reason).toContain("Reflector Stop Review");
+					expect(result?.reason).toContain("Judged by jev-1.14.0.");
 				} else {
 					expect(result).toBeUndefined();
 				}
 				expect(sendMessageCalls).toHaveLength(0);
+				expect(notices.some((n) => n.msg.includes("review skipped"))).toBe(false);
 			} finally {
-				process.env.PATH = prevPath;
-				if (prevStopReview === undefined) delete process.env.CODEX_REFLECTOR_STOP_REVIEW;
-				else process.env.CODEX_REFLECTOR_STOP_REVIEW = prevStopReview;
-				rmSync(binDir, { recursive: true, force: true });
+				restore();
+				testSetJudge(undefined);
 			}
-		}, 15_000);
+		});
 	}
 
-	test("session_stop invokes codex with the frontier stop preset", async () => {
-		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
-		const argsLog = join(binDir, "args.log");
-		writeFileSync(
-			join(binDir, "codex"),
-			`#!/bin/sh
-ARGS_LOG=${JSON.stringify(argsLog)}
-printf '%s\\n' "$*" >> "$ARGS_LOG"
-out=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -o) out="$2"; shift 2 ;;
-    *) shift ;;
-  esac
-done
-[ -n "$out" ] && printf 'PASS\\n' > "$out"
-exit 0
-`,
+	test("session_stop with a level-1-heavy dimension settles without blocking (amendment case 4)", async () => {
+		const restore = setEnv("CODEX_REFLECTOR_STOP_REVIEW", "1");
+		testSetJudge(async () =>
+			judgeResult(dimensionAnswers({ correctness: scoreAnswer({ "0": 0.05, "1": 0.93, "2": 0.02 }) })),
 		);
-		chmodSync(join(binDir, "codex"), 0o755);
-		const prevPath = process.env.PATH ?? "";
-		const prevModel = process.env.CODEX_REFLECTOR_MODEL;
-		const prevStopReview = process.env.CODEX_REFLECTOR_STOP_REVIEW;
-		process.env.PATH = `${binDir}:${prevPath}`;
-		delete process.env.CODEX_REFLECTOR_MODEL;
-		process.env.CODEX_REFLECTOR_STOP_REVIEW = "1";
-		try {
-			const { pi, handlers } = makePi();
-			codexReflector(pi);
-			const handler = handlers.get("session_stop");
-			expect(handler).toBeDefined();
-			const result = await handler?.(
-				{
-					type: "session_stop",
-					messages: [
-						{ role: "user", content: "hi" },
-						{ role: "assistant", content: "did work" },
-					],
-					turn_id: 1,
-					session_id: "s",
-					stop_hook_active: false,
-				},
-				{ cwd: ".", hasUI: false, ui: { notify() {} } },
-			);
-			expect(result).toBeUndefined();
-			const argsLines = readFileSync(argsLog, "utf8").trim().split("\n");
-			expect(argsLines).toHaveLength(1);
-			expect(argsLines[0]).toContain("-m gpt-5.6-sol");
-			expect(argsLines[0]).toContain("model_reasoning_effort=medium");
-		} finally {
-			process.env.PATH = prevPath;
-			if (prevModel === undefined) delete process.env.CODEX_REFLECTOR_MODEL;
-			else process.env.CODEX_REFLECTOR_MODEL = prevModel;
-			if (prevStopReview === undefined) delete process.env.CODEX_REFLECTOR_STOP_REVIEW;
-			else process.env.CODEX_REFLECTOR_STOP_REVIEW = prevStopReview;
-			rmSync(binDir, { recursive: true, force: true });
-		}
-	}, 15_000);
-
-	test("session_before_compact invokes codex with the frontier precompact preset", async () => {
-		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
-		const argsLog = join(binDir, "args.log");
-		writeFileSync(
-			join(binDir, "codex"),
-			`#!/bin/sh
-ARGS_LOG=${JSON.stringify(argsLog)}
-printf '%s\\n' "$*" >> "$ARGS_LOG"
-out=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -o) out="$2"; shift 2 ;;
-    *) shift ;;
-  esac
-done
-[ -n "$out" ] && printf 'reflect\\n' > "$out"
-exit 0
-`,
-		);
-		chmodSync(join(binDir, "codex"), 0o755);
-		const prevPath = process.env.PATH ?? "";
-		const prevModel = process.env.CODEX_REFLECTOR_MODEL;
-		process.env.PATH = `${binDir}:${prevPath}`;
-		delete process.env.CODEX_REFLECTOR_MODEL;
-		try {
-			const { pi, handlers } = makePi();
-			codexReflector(pi);
-			const handler = handlers.get("session_before_compact");
-			expect(handler).toBeDefined();
-			await handler?.(
-				{
-					type: "session_before_compact",
-					preparation: {
-						messagesToSummarize: [{ role: "user", content: "work to reflect on" }],
-					},
-				},
-				{ cwd: ".", hasUI: false, ui: { notify() {} } },
-			);
-			const argsLines = readFileSync(argsLog, "utf8").trim().split("\n");
-			// One main precompact invoke; matryoshka may not fire for a short transcript.
-			expect(argsLines.length).toBeGreaterThanOrEqual(1);
-			const precompactLine = argsLines[argsLines.length - 1] ?? "";
-			expect(precompactLine).toContain("-m gpt-5.6-sol");
-			expect(precompactLine).toContain("model_reasoning_effort=low");
-		} finally {
-			process.env.PATH = prevPath;
-			if (prevModel === undefined) delete process.env.CODEX_REFLECTOR_MODEL;
-			else process.env.CODEX_REFLECTOR_MODEL = prevModel;
-			rmSync(binDir, { recursive: true, force: true });
-		}
-	}, 15_000);
-
-	test("session_stop with stop_hook_active=true settles without re-reviewing", async () => {
-		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
-		const invokeLog = join(binDir, "invoked.log");
-		writeFileSync(
-			join(binDir, "codex"),
-			`#!/bin/sh
-echo $$ >> ${JSON.stringify(invokeLog)}
-out=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -o) out="$2"; shift 2 ;;
-    *) shift ;;
-  esac
-done
-[ -n "$out" ] && printf '%s\n' ${JSON.stringify("FAIL: missing guard")} > "$out"
-exit 0
-`,
-		);
-		chmodSync(join(binDir, "codex"), 0o755);
-		const prevPath = process.env.PATH ?? "";
-		const prevStopReview = process.env.CODEX_REFLECTOR_STOP_REVIEW;
-		process.env.PATH = `${binDir}:${prevPath}`;
-		process.env.CODEX_REFLECTOR_STOP_REVIEW = "1";
 		try {
 			const { pi, handlers, sendMessageCalls } = makePi();
 			codexReflector(pi);
-			const handler = handlers.get("session_stop");
-			expect(handler).toBeDefined();
-			const result = await handler?.(
-				{
-					type: "session_stop",
-					messages: [
-						{ role: "user", content: "hi" },
-						{ role: "assistant", content: "did work" },
-					],
-					turn_id: 1,
-					session_id: "s",
-					stop_hook_active: true,
-				},
-				{ cwd: ".", hasUI: false, ui: { notify() {} } },
-			);
+			const { ctx } = notifyingCtx();
+			const result = await handlers.get("session_stop")?.(stopEvent(), ctx);
 			expect(result).toBeUndefined();
-			expect(existsSync(invokeLog)).toBe(false);
 			expect(sendMessageCalls).toHaveLength(0);
 		} finally {
-			process.env.PATH = prevPath;
-			if (prevStopReview === undefined) delete process.env.CODEX_REFLECTOR_STOP_REVIEW;
-			else process.env.CODEX_REFLECTOR_STOP_REVIEW = prevStopReview;
-			rmSync(binDir, { recursive: true, force: true });
+			restore();
+			testSetJudge(undefined);
 		}
-	}, 15_000);
+	});
 
-	// Abort guard: an aborted-tail settle skips the holistic review entirely
-	// (Claude Code parity — its Stop hook never fires on user interrupt).
-	test("session_stop settles without review when the settled turn was aborted", async () => {
-		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
-		const invokeLog = join(binDir, "invoked.log");
-		writeFileSync(join(binDir, "codex"), `#!/bin/sh\necho $$ >> ${JSON.stringify(invokeLog)}\nexit 0\n`);
-		chmodSync(join(binDir, "codex"), 0o755);
-		const prevPath = process.env.PATH ?? "";
-		const prevStopReview = process.env.CODEX_REFLECTOR_STOP_REVIEW;
-		process.env.PATH = `${binDir}:${prevPath}`;
-		process.env.CODEX_REFLECTOR_STOP_REVIEW = "1";
+	test("session_stop with stop_hook_active=true settles without judging", async () => {
+		const restore = setEnv("CODEX_REFLECTOR_STOP_REVIEW", "1");
+		let judgeCalls = 0;
+		testSetJudge(async () => {
+			judgeCalls++;
+			return judgeResult(dimensionAnswers({ correctness: scoreAnswer({ "0": 0.9, "1": 0.05, "2": 0.05 }) }));
+		});
 		try {
 			const { pi, handlers, sendMessageCalls } = makePi();
 			codexReflector(pi);
-			const handler = handlers.get("session_stop");
-			expect(handler).toBeDefined();
-			const result = await handler?.(
+			const { ctx } = notifyingCtx();
+			const result = await handlers.get("session_stop")?.(stopEvent(true), ctx);
+			expect(result).toBeUndefined();
+			expect(judgeCalls).toBe(0);
+			expect(sendMessageCalls).toHaveLength(0);
+		} finally {
+			restore();
+			testSetJudge(undefined);
+		}
+	});
+
+	test("session_stop settles without judging when the settled turn was aborted", async () => {
+		const restore = setEnv("CODEX_REFLECTOR_STOP_REVIEW", "1");
+		let judgeCalls = 0;
+		testSetJudge(async () => {
+			judgeCalls++;
+			return judgeResult(dimensionAnswers());
+		});
+		try {
+			const { pi, handlers, sendMessageCalls } = makePi();
+			codexReflector(pi);
+			const { ctx } = notifyingCtx();
+			const result = await handlers.get("session_stop")?.(
 				{
-					type: "session_stop",
-					messages: [
-						{ role: "user", content: "hi" },
-						{ role: "assistant", content: "partial" },
-					],
-					turn_id: 1,
-					session_id: "s",
-					stop_hook_active: false,
+					...stopEvent(),
 					last_assistant_message: { role: "assistant", content: "partial", stopReason: "aborted" },
 				},
-				{ cwd: ".", hasUI: false, ui: { notify() {} } },
+				ctx,
 			);
 			expect(result).toBeUndefined();
-			expect(existsSync(invokeLog)).toBe(false);
+			expect(judgeCalls).toBe(0);
 			expect(sendMessageCalls).toHaveLength(0);
 		} finally {
-			process.env.PATH = prevPath;
-			if (prevStopReview === undefined) delete process.env.CODEX_REFLECTOR_STOP_REVIEW;
-			else process.env.CODEX_REFLECTOR_STOP_REVIEW = prevStopReview;
-			rmSync(binDir, { recursive: true, force: true });
+			restore();
+			testSetJudge(undefined);
 		}
-	}, 15_000);
+	});
 
 	test("session_stop abort guard falls back to the messages tail", async () => {
-		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
-		const invokeLog = join(binDir, "invoked.log");
-		writeFileSync(join(binDir, "codex"), `#!/bin/sh\necho $$ >> ${JSON.stringify(invokeLog)}\nexit 0\n`);
-		chmodSync(join(binDir, "codex"), 0o755);
-		const prevPath = process.env.PATH ?? "";
-		const prevStopReview = process.env.CODEX_REFLECTOR_STOP_REVIEW;
-		process.env.PATH = `${binDir}:${prevPath}`;
-		process.env.CODEX_REFLECTOR_STOP_REVIEW = "1";
+		const restore = setEnv("CODEX_REFLECTOR_STOP_REVIEW", "1");
+		let judgeCalls = 0;
+		testSetJudge(async () => {
+			judgeCalls++;
+			return judgeResult(dimensionAnswers());
+		});
 		try {
 			const { pi, handlers, sendMessageCalls } = makePi();
 			codexReflector(pi);
-			const handler = handlers.get("session_stop");
-			expect(handler).toBeDefined();
-			const result = await handler?.(
+			const { ctx } = notifyingCtx();
+			const result = await handlers.get("session_stop")?.(
 				{
 					type: "session_stop",
-					messages: [
-						{ role: "user", content: "hi" },
-						{ role: "assistant", content: "partial", stopReason: "aborted" },
-					],
+					messages: [{ role: "assistant", content: "partial", stopReason: "aborted" }],
 					turn_id: 1,
 					session_id: "s",
 					stop_hook_active: false,
 				},
-				{ cwd: ".", hasUI: false, ui: { notify() {} } },
+				ctx,
 			);
 			expect(result).toBeUndefined();
-			expect(existsSync(invokeLog)).toBe(false);
+			expect(judgeCalls).toBe(0);
 			expect(sendMessageCalls).toHaveLength(0);
 		} finally {
-			process.env.PATH = prevPath;
-			if (prevStopReview === undefined) delete process.env.CODEX_REFLECTOR_STOP_REVIEW;
-			else process.env.CODEX_REFLECTOR_STOP_REVIEW = prevStopReview;
-			rmSync(binDir, { recursive: true, force: true });
+			restore();
+			testSetJudge(undefined);
 		}
-	}, 15_000);
-	// Per-tool code review is advisory: every verdict (PASS/UNCERTAIN/FAIL) rides along as
-	// appended content and NONE sets isError, so a succeeded edit is never blocked.
-	// Enforcement is separate: pre-execution bash guard and holistic session_stop review.
-	// The fake codex writes the verdict to the -o file (invokeCodex ignores stdout).
-	const CODE_REVIEW_VERDICTS: ReadonlyArray<{ name: string; out: string }> = [
-		{ name: "PASS", out: "PASS" },
-		{ name: "UNCERTAIN", out: "still investigating" },
-		{ name: "FAIL", out: "FAIL: missing guard" },
+	});
+
+	// Per-tool code review is advisory: every verdict rides along as appended
+	// content and NONE sets isError, so a succeeded edit is never blocked.
+	const WRITE_CASES: ReadonlyArray<{ name: string; answers: Record<string, Answer> }> = [
+		{ name: "PASS", answers: writeAnswers() },
+		{
+			name: "FAIL",
+			answers: writeAnswers({ correctness: scoreAnswer({ "0": 0.95, "1": 0.03, "2": 0.02 }) }),
+		},
+		{
+			name: "UNCERTAIN",
+			answers: writeAnswers({ slop: scoreAnswer({ "0": 0.5, "1": 0.25, "2": 0.25 }) }),
+		},
 	];
-	for (const c of CODE_REVIEW_VERDICTS) {
-		test(`tool_result code_change ${c.name} stays advisory`, async () => {
-			const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
-			writeFileSync(
-				join(binDir, "codex"),
-				`#!/bin/sh\nout=""\nwhile [ $# -gt 0 ]; do\n  case "$1" in\n    -o) out="$2"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[ -n "$out" ] && printf '%s\\n' ${JSON.stringify(c.out)} > "$out"\nexit 0\n`,
-			);
-			chmodSync(join(binDir, "codex"), 0o755);
-			const prevPath = process.env.PATH ?? "";
-			process.env.PATH = `${binDir}:${prevPath}`;
+	for (const c of WRITE_CASES) {
+		test(`tool_result code_change ${c.name} returns a content override with scorecard, never isError`, async () => {
+			testSetJudge(async () => judgeResult(c.answers));
 			try {
 				const { pi, handlers } = makePi();
 				codexReflector(pi);
 				const handler = handlers.get("tool_result");
 				expect(handler).toBeDefined();
-				const event = {
-					type: "tool_result",
-					toolName: "write",
-					toolCallId: "id",
-					input: { path: "x.ts", content: "const a = 1;" },
-					content: [],
-					isError: false,
-				} as unknown as Parameters<NonNullable<typeof handler>>[0];
-				const ctx = { cwd: ".", hasUI: false, ui: { notify() {} } } as unknown as Parameters<
-					NonNullable<typeof handler>
-				>[1];
-				const result = (await handler?.(event, ctx)) as
-					| { content?: Array<{ type: string; text: string }>; isError?: boolean }
-					| undefined;
+				const { ctx, notices } = notifyingCtx();
+				const result = (await handler?.(writeEvent(), ctx)) as ContentResult | undefined;
 				expect(result).toBeDefined();
 				expect(result?.isError).toBeFalsy();
 				const last = result?.content?.at(-1);
 				expect(last?.type).toBe("text");
 				expect(last?.text).toContain(c.name);
+				expect(last?.text).toContain("Reflector Review");
+				expect(last?.text).toContain("[x.ts]");
+				expect(last?.text).toContain("Judged by jev-1.14.0.");
+				if (c.name === "FAIL") {
+					const notice = notices.find((n) => n.level === "warning" && n.msg.includes("FAIL"));
+					expect(notice?.msg.startsWith("Reflector Review")).toBe(true);
+				}
 			} finally {
-				process.env.PATH = prevPath;
-				rmSync(binDir, { recursive: true, force: true });
+				testSetJudge(undefined);
 			}
-		}, 15_000);
+		});
 	}
 
-	test("CODEX_REFLECTOR_MODEL override swaps only the model, never the effort", async () => {
-		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
-		const argsLog = join(binDir, "args.log");
-		writeFileSync(
-			join(binDir, "codex"),
-			`#!/bin/sh
-ARGS_LOG=${JSON.stringify(argsLog)}
-printf '%s\\n' "$*" >> "$ARGS_LOG"
-out=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -o) out="$2"; shift 2 ;;
-    *) shift ;;
-  esac
-done
-[ -n "$out" ] && printf 'PASS\\n' > "$out"
-exit 0
-`,
-		);
-		chmodSync(join(binDir, "codex"), 0o755);
-		const prevPath = process.env.PATH ?? "";
-		const prevModel = process.env.CODEX_REFLECTOR_MODEL;
-		process.env.PATH = `${binDir}:${prevPath}`;
-		process.env.CODEX_REFLECTOR_MODEL = "gpt-5.3-codex-spark";
+	test("an errored write or edit tool_result returns undefined without judging", async () => {
+		let judgeCalls = 0;
+		testSetJudge(async () => {
+			judgeCalls++;
+			return judgeResult(writeAnswers());
+		});
 		try {
 			const { pi, handlers } = makePi();
 			codexReflector(pi);
-			const handler = handlers.get("tool_result");
-			expect(handler).toBeDefined();
-			const event = {
+			const { ctx } = notifyingCtx();
+			const edit = {
 				type: "tool_result",
-				toolName: "write",
+				toolName: "edit",
 				toolCallId: "id",
-				input: { path: "src/util.ts", content: "const x = 1;" },
+				input: { input: "[x.ts#AAAA]\nbody" },
 				content: [],
-				isError: false,
-			} as unknown as Parameters<NonNullable<typeof handler>>[0];
-			const ctx = { cwd: ".", hasUI: false, ui: { notify() {} } } as unknown as Parameters<
-				NonNullable<typeof handler>
-			>[1];
-			const result = await handler?.(event, ctx);
-			expect(result).toBeDefined();
-			const argsLines = readFileSync(argsLog, "utf8").trim().split("\n");
-			expect(argsLines).toHaveLength(1);
-			expect(argsLines[0]).toContain("-m gpt-5.3-codex-spark");
-			expect(argsLines[0]).toContain("model_reasoning_effort=medium");
+				isError: true,
+			};
+			expect(await handlers.get("tool_result")?.({ ...writeEvent(), isError: true }, ctx)).toBeUndefined();
+			expect(await handlers.get("tool_result")?.(edit, ctx)).toBeUndefined();
+			expect(judgeCalls).toBe(0);
 		} finally {
-			process.env.PATH = prevPath;
-			if (prevModel === undefined) delete process.env.CODEX_REFLECTOR_MODEL;
-			else process.env.CODEX_REFLECTOR_MODEL = prevModel;
-			rmSync(binDir, { recursive: true, force: true });
+			testSetJudge(undefined);
+		}
+	});
+
+	const THROWING_ROUTES: ReadonlyArray<{ label: string; handler: string; event: Record<string, unknown>; env: Record<string, string> }> = [
+		{ label: "write review", handler: "tool_result", event: writeEvent(), env: {} },
+		{ label: "stop gate", handler: "session_stop", event: stopEvent(), env: { CODEX_REFLECTOR_STOP_REVIEW: "1" } },
+		{ label: "bash guard", handler: "tool_call", event: bashEvent("rm -rf /tmp/x"), env: { CODEX_REFLECTOR_BASH_GUARD: "1" } },
+	];
+	for (const route of THROWING_ROUTES) {
+		test(`${route.label} proceeds when the judge throws, warning with the thrown message`, async () => {
+			const restores = Object.entries(route.env).map(([name, value]) => setEnv(name, value));
+			testSetJudge(async () => {
+				throw new Error("judge exploded");
+			});
+			try {
+				const { pi, handlers, sendMessageCalls } = makePi();
+				codexReflector(pi);
+				const handler = handlers.get(route.handler);
+				expect(handler).toBeDefined();
+				const { ctx, notices } = notifyingCtx();
+				const result = await handler?.(route.event, ctx);
+				expect(result).toBeUndefined();
+				const skip = notices.find((n) => n.msg.includes("review skipped"));
+				expect(skip?.level).toBe("warning");
+				expect(skip?.msg).toContain("judge exploded");
+				expect(sendMessageCalls).toHaveLength(0);
+			} finally {
+				for (const restore of restores) restore();
+				testSetJudge(undefined);
+			}
+		});
+	}
+	for (const route of THROWING_ROUTES) {
+		test(`${route.label} proceeds unreviewed when the judge returns no answers`, async () => {
+			const restores = Object.entries(route.env).map(([name, value]) => setEnv(name, value));
+			testSetJudge(async () => judgeResult({}));
+			try {
+				const { pi, handlers } = makePi();
+				codexReflector(pi);
+				const { ctx, notices } = notifyingCtx();
+				const result = await handlers.get(route.handler)?.(route.event, ctx);
+				expect(result).toBeUndefined();
+				expect(notices.find((n) => n.msg.includes("review skipped"))?.level).toBe("warning");
+			} finally {
+				for (const restore of restores) restore();
+				testSetJudge(undefined);
+			}
+		});
+	}
+
+	test("a probability above one skips the stop gate instead of blocking", async () => {
+		const restore = setEnv("CODEX_REFLECTOR_STOP_REVIEW", "1");
+		testSetJudge(async () =>
+			judgeResult(dimensionAnswers({ correctness: scoreAnswer({ "0": 1.53, "1": 0.05, "2": 0.05 }) })),
+		);
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const { ctx, notices } = notifyingCtx();
+			const result = await handlers.get("session_stop")?.(stopEvent(), ctx);
+			expect(result).toBeUndefined();
+			expect(notices.find((n) => n.msg.includes("review skipped"))?.level).toBe("warning");
+		} finally {
+			restore();
+			testSetJudge(undefined);
+		}
+	});
+
+	const INVALID_NUMBERS: ReadonlyArray<{ name: string; value: string | number | boolean }> = [
+		{ name: "a negative probability", value: -0.1 },
+		{ name: "NaN", value: Number.NaN },
+		{ name: "Infinity", value: Number.POSITIVE_INFINITY },
+		{ name: "a boolean", value: true },
+		{ name: "a numeric string", value: "0.9" },
+	];
+	for (const { name, value } of INVALID_NUMBERS) {
+		test(`${name} in score probabilities skips the stop gate instead of blocking`, async () => {
+			const restore = setEnv("CODEX_REFLECTOR_STOP_REVIEW", "1");
+			testSetJudge(async () =>
+				judgeResult(
+					dimensionAnswers({
+						correctness: {
+							type: "score",
+							score: 0,
+							probabilities: { "0": value, "1": 0.05, "2": 0.05 },
+							confidence: 1,
+						} as Answer,
+					}),
+				),
+			);
+			try {
+				const { pi, handlers } = makePi();
+				codexReflector(pi);
+				const { ctx, notices } = notifyingCtx();
+				const result = await handlers.get("session_stop")?.(stopEvent(), ctx);
+				expect(result).toBeUndefined();
+				const skip = notices.find((n) => n.msg.includes("review skipped"));
+				expect(skip?.level).toBe("warning");
+			} finally {
+				restore();
+				testSetJudge(undefined);
+			}
+		});
+		test(`${name} in a noul answer skips the write review instead of passing it`, async () => {
+			testSetJudge(async () =>
+				judgeResult(writeAnswers({ is_executable_code: { type: "noul", noul: value } as Answer })),
+			);
+			try {
+				const { pi, handlers } = makePi();
+				codexReflector(pi);
+				const { ctx, notices } = notifyingCtx();
+				const result = await handlers.get("tool_result")?.(writeEvent(), ctx);
+				expect(result).toBeUndefined();
+				const skip = notices.find((n) => n.msg.includes("review skipped"));
+				expect(skip?.level).toBe("warning");
+			} finally {
+				testSetJudge(undefined);
+			}
+		});
+	}
+
+	test("a score answer without all three levels skips the write review instead of passing it", async () => {
+		testSetJudge(async () => judgeResult(writeAnswers({ correctness: scoreAnswer({ "0": 0.05, "1": 0.05 }) })));
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const { ctx, notices } = notifyingCtx();
+			const result = await handlers.get("tool_result")?.(writeEvent(), ctx);
+			expect(result).toBeUndefined();
+			expect(notices.find((n) => n.msg.includes("review skipped"))?.level).toBe("warning");
+		} finally {
+			testSetJudge(undefined);
+		}
+	});
+
+	test("the judge receives a signal that aborts at the handler budget, and an aborting judge fails open", async () => {
+		const { promise: aborted, resolve: markAborted } = Promise.withResolvers<void>();
+		let received: AbortSignal | undefined;
+		testSetJudge(async (_state, _questions, _ctx, signal) => {
+			received = signal;
+			signal.addEventListener("abort", () => markAborted(), { once: true });
+			await aborted;
+			throw signal.reason instanceof Error ? signal.reason : new Error("aborted");
+		});
+		testSetHandlerBudgetMs(300);
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const { ctx, notices } = notifyingCtx();
+			const start = Date.now();
+			const result = await handlers.get("tool_result")?.(writeEvent(), ctx);
+			const elapsed = Date.now() - start;
+			expect(result).toBeUndefined();
+			expect(received).toBeInstanceOf(AbortSignal);
+			expect(received?.aborted).toBe(true);
+			expect(elapsed).toBeLessThan(5_000);
+			const skip = notices.find((n) => n.msg.includes("review skipped"));
+			expect(skip?.level).toBe("warning");
+		} finally {
+			testSetJudge(undefined);
+			testSetHandlerBudgetMs(HANDLER_BUDGET_MS);
 		}
 	}, 15_000);
 
-	test("fast_edit tool_result appends an advisory review with the target path", async () => {
-		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
-		writeFileSync(
-			join(binDir, "codex"),
-			`#!/bin/sh\nout=""\nwhile [ $# -gt 0 ]; do\n  case "$1" in\n    -o) out="$2"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[ -n "$out" ] && printf 'PASS\\n' > "$out"\nexit 0\n`,
-		);
-		chmodSync(join(binDir, "codex"), 0o755);
-		const prevPath = process.env.PATH ?? "";
-		process.env.PATH = `${binDir}:${prevPath}`;
+	test("the judged state is redacted before it leaves the process", async () => {
+		let captured: Record<string, string> | undefined;
+		testSetJudge(async (state) => {
+			captured = state;
+			return judgeResult(writeAnswers());
+		});
 		try {
 			const { pi, handlers } = makePi();
 			codexReflector(pi);
-			const handler = handlers.get("tool_result");
-			expect(handler).toBeDefined();
-			const result = (await handler?.(
+			const { ctx } = notifyingCtx();
+			await handlers.get("tool_result")?.(
+				writeEvent("const a = 1;\ntoken ghp_0123456789abcdefghijklmn\nexport {};"),
+				ctx,
+			);
+			expect(captured).toBeDefined();
+			expect(JSON.stringify(captured)).not.toContain("ghp_0123456789abcdefghijklmn");
+			expect(captured?.subject).toContain("[REDACTED]");
+		} finally {
+			testSetJudge(undefined);
+		}
+	});
+
+	test("bash guard blocks when the largest answer reaches BLOCK_AT", async () => {
+		const restore = setEnv("CODEX_REFLECTOR_BASH_GUARD", "1");
+		let capturedState: Record<string, string> | undefined;
+		testSetJudge(async (state) => {
+			capturedState = state;
+			return judgeResult({
+				destroys_outside_workspace: noulAnswer(0.9),
+				rewrites_shared_history: noulAnswer(0.1),
+				pipes_remote_to_shell: noulAnswer(0.1),
+				exfiltrates_secrets: noulAnswer(0.1),
+				escalates_privilege: noulAnswer(0.1),
+			});
+		});
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const { ctx, notices } = notifyingCtx();
+			const result = (await handlers.get("tool_call")?.(bashEvent("rm -rf /"), ctx)) as GuardResult | undefined;
+			expect(Object.keys(capturedState ?? {})).toEqual(["command", "cwd"]);
+			expect(notices.find((n) => n.msg.includes("Reflector Bash Guard"))?.level).toBe("warning");
+			expect(result).toEqual({
+				block: true,
+				reason:
+					"Blocked by decision model: the command destroys or overwrites data outside the working directory (rm/dd/mkfs/chmod-chown sweeps, redirects onto devices) (P=0.90). Judged by jev-1.14.0.",
+			});
+		} finally {
+			restore();
+			testSetJudge(undefined);
+		}
+	});
+
+	test("bash guard lets the command run when every answer stays below BLOCK_AT", async () => {
+		const restore = setEnv("CODEX_REFLECTOR_BASH_GUARD", "1");
+		testSetJudge(async () =>
+			judgeResult({
+				destroys_outside_workspace: noulAnswer(0.8999),
+				rewrites_shared_history: noulAnswer(0.1),
+				pipes_remote_to_shell: noulAnswer(0.1),
+				exfiltrates_secrets: noulAnswer(0.1),
+				escalates_privilege: noulAnswer(0.1),
+			}),
+		);
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const { ctx, notices } = notifyingCtx();
+			const result = await handlers.get("tool_call")?.(bashEvent("rm -rf /"), ctx);
+			expect(result).toBeUndefined();
+			expect(notices.some((n) => n.msg.includes("review skipped"))).toBe(false);
+		} finally {
+			restore();
+			testSetJudge(undefined);
+		}
+	});
+
+	test("bash guard does not call the judge for a command the prescreen rejects", async () => {
+		const restore = setEnv("CODEX_REFLECTOR_BASH_GUARD", "1");
+		let judgeCalls = 0;
+		testSetJudge(async () => {
+			judgeCalls++;
+			return judgeResult({});
+		});
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const { ctx } = notifyingCtx();
+			const result = await handlers.get("tool_call")?.(bashEvent("git status"), ctx);
+			expect(result).toBeUndefined();
+			expect(judgeCalls).toBe(0);
+		} finally {
+			restore();
+			testSetJudge(undefined);
+		}
+	});
+
+	test("tool_call bash guard is disabled by default (opt-in)", async () => {
+		const restore = setEnv("CODEX_REFLECTOR_BASH_GUARD", undefined);
+		let judgeCalls = 0;
+		testSetJudge(async () => {
+			judgeCalls++;
+			return judgeResult({});
+		});
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const { ctx } = notifyingCtx();
+			const result = await handlers.get("tool_call")?.(bashEvent("rm -rf /"), ctx);
+			expect(result).toBeUndefined();
+			expect(judgeCalls).toBe(0);
+		} finally {
+			restore();
+			testSetJudge(undefined);
+		}
+	});
+
+	test("CODEX_REFLECTOR_BASH_GUARD=0 skips the judge and allows the command", async () => {
+		const restore = setEnv("CODEX_REFLECTOR_BASH_GUARD", "0");
+		let judgeCalls = 0;
+		testSetJudge(async () => {
+			judgeCalls++;
+			return judgeResult({});
+		});
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const { ctx } = notifyingCtx();
+			const result = await handlers.get("tool_call")?.(bashEvent("rm -rf /tmp/x"), ctx);
+			expect(result).toBeUndefined();
+			expect(judgeCalls).toBe(0);
+		} finally {
+			restore();
+			testSetJudge(undefined);
+		}
+	});
+
+	test("fastcompact device write is not reviewed", async () => {
+		let judgeCalls = 0;
+		testSetJudge(async () => {
+			judgeCalls++;
+			return judgeResult(writeAnswers());
+		});
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const { ctx } = notifyingCtx();
+			const result = await handlers.get("tool_result")?.(
+				{
+					type: "tool_result",
+					toolName: "write",
+					toolCallId: "id",
+					input: { path: "xd://fastcompact", content: JSON.stringify({ location: "README.md" }) },
+					content: [{ type: "text", text: "compacted" }],
+					isError: false,
+				},
+				ctx,
+			);
+			expect(result).toBeUndefined();
+			expect(judgeCalls).toBe(0);
+		} finally {
+			testSetJudge(undefined);
+		}
+	});
+
+	test("fast_edit tool_result appends an advisory review with the target path and the request", async () => {
+		let capturedState: Record<string, string> | undefined;
+		testSetJudge(async (state) => {
+			capturedState = state;
+			return judgeResult(writeAnswers());
+		});
+		try {
+			const { pi, handlers } = makePi();
+			codexReflector(pi);
+			const { ctx } = notifyingCtx();
+			const result = (await handlers.get("tool_result")?.(
 				{
 					type: "tool_result",
 					toolName: "fast_edit",
@@ -774,66 +1139,27 @@ exit 0
 					content: [{ type: "text", text: "Applied edit to src/a.ts" }],
 					isError: false,
 				},
-				{ cwd: ".", hasUI: false, ui: { notify() {} } },
-			)) as { content?: Array<{ type: string; text: string }>; isError?: boolean } | undefined;
+				ctx,
+			)) as ContentResult | undefined;
 			expect(result).toBeDefined();
 			expect(result?.isError).toBeFalsy();
 			const last = result?.content?.at(-1);
 			expect(last?.text).toContain("PASS");
 			expect(last?.text).toContain("[src/a.ts]");
+			expect(capturedState?.request).toBe("add guard");
+			expect(capturedState?.file).toBe("src/a.ts");
 		} finally {
-			process.env.PATH = prevPath;
-			rmSync(binDir, { recursive: true, force: true });
+			testSetJudge(undefined);
 		}
-	}, 15_000);
-
-	test("fastcompact device write is not reviewed", async () => {
-		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
-		writeFileSync(
-			join(binDir, "codex"),
-			`#!/bin/sh\nout=""\nwhile [ $# -gt 0 ]; do\n  case "$1" in\n    -o) out="$2"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[ -n "$out" ] && printf 'PASS\\n' > "$out"\nexit 0\n`,
-		);
-		chmodSync(join(binDir, "codex"), 0o755);
-		const prevPath = process.env.PATH ?? "";
-		process.env.PATH = `${binDir}:${prevPath}`;
-		try {
-			const { pi, handlers } = makePi();
-			codexReflector(pi);
-			const handler = handlers.get("tool_result");
-			expect(handler).toBeDefined();
-			const result = await handler?.(
-				{
-					type: "tool_result",
-					toolName: "write",
-					toolCallId: "id",
-					input: { path: "xd://fastcompact", content: JSON.stringify({ location: "README.md" }) },
-					content: [{ type: "text", text: "compacted" }],
-					isError: false,
-				},
-				{ cwd: ".", hasUI: false, ui: { notify() {} } },
-			);
-			expect(result).toBeUndefined();
-		} finally {
-			process.env.PATH = prevPath;
-			rmSync(binDir, { recursive: true, force: true });
-		}
-	}, 15_000);
+	});
 
 	test("fast_edit device write is reviewed with its real target", async () => {
-		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
-		writeFileSync(
-			join(binDir, "codex"),
-			`#!/bin/sh\nout=""\nwhile [ $# -gt 0 ]; do\n  case "$1" in\n    -o) out="$2"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[ -n "$out" ] && printf 'PASS\\n' > "$out"\nexit 0\n`,
-		);
-		chmodSync(join(binDir, "codex"), 0o755);
-		const prevPath = process.env.PATH ?? "";
-		process.env.PATH = `${binDir}:${prevPath}`;
+		testSetJudge(async () => judgeResult(writeAnswers()));
 		try {
 			const { pi, handlers } = makePi();
 			codexReflector(pi);
-			const handler = handlers.get("tool_result");
-			expect(handler).toBeDefined();
-			const result = (await handler?.(
+			const { ctx } = notifyingCtx();
+			const result = (await handlers.get("tool_result")?.(
 				{
 					type: "tool_result",
 					toolName: "write",
@@ -854,492 +1180,26 @@ exit 0
 					content: [{ type: "text", text: "Applied edit to src/a.ts" }],
 					isError: false,
 				},
-				{ cwd: ".", hasUI: false, ui: { notify() {} } },
-			)) as { content?: Array<{ type: string; text: string }>; isError?: boolean } | undefined;
+				ctx,
+			)) as ContentResult | undefined;
 			expect(result).toBeDefined();
 			expect(result?.isError).toBeFalsy();
 			const last = result?.content?.at(-1);
 			expect(last?.text).toContain("PASS");
 			expect(last?.text).toContain("[src/a.ts]");
 		} finally {
-			process.env.PATH = prevPath;
-			rmSync(binDir, { recursive: true, force: true });
-		}
-	}, 15_000);
-
-	const BASH_GUARD_VERDICTS: ReadonlyArray<{
-		name: string;
-		out: string;
-		blocked: boolean;
-	}> = [
-		{ name: "FAIL", out: "FAIL: destroys data outside workspace", blocked: true },
-		{ name: "PASS", out: "PASS", blocked: false },
-		{ name: "UNCERTAIN", out: "still checking", blocked: false },
-	];
-	for (const c of BASH_GUARD_VERDICTS) {
-		test(`tool_call bash guard ${c.name} ${c.blocked ? "blocks" : "fails open"}`, async () => {
-			const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
-			writeFileSync(
-				join(binDir, "codex"),
-				`#!/bin/sh\nout=""\nwhile [ $# -gt 0 ]; do\n  case "$1" in\n    -o) out="$2"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[ -n "$out" ] && printf '%s\\n' ${JSON.stringify(c.out)} > "$out"\nexit 0\n`,
-			);
-			chmodSync(join(binDir, "codex"), 0o755);
-			const prevPath = process.env.PATH ?? "";
-			const prevGuard = process.env.CODEX_REFLECTOR_BASH_GUARD;
-			process.env.PATH = `${binDir}:${prevPath}`;
-			process.env.CODEX_REFLECTOR_BASH_GUARD = "1";
-			try {
-				const { pi, handlers } = makePi();
-				codexReflector(pi);
-				const handler = handlers.get("tool_call");
-				expect(handler).toBeDefined();
-				const result = (await handler?.(
-					{
-						type: "tool_call",
-						toolName: "bash",
-						toolCallId: "id",
-						input: { command: "rm -rf /" },
-					},
-					{ cwd: ".", hasUI: false, ui: { notify() {} } },
-				)) as { block?: boolean; reason?: string } | undefined;
-				if (c.blocked) {
-					expect(result).toEqual({
-						block: true,
-						reason: expect.stringContaining("Codex Bash Guard FAIL"),
-					});
-				} else {
-					expect(result).toBeUndefined();
-				}
-			} finally {
-				process.env.PATH = prevPath;
-				if (prevGuard === undefined) delete process.env.CODEX_REFLECTOR_BASH_GUARD;
-				else process.env.CODEX_REFLECTOR_BASH_GUARD = prevGuard;
-				rmSync(binDir, { recursive: true, force: true });
-			}
-		}, 15_000);
-	}
-
-	test("CODEX_REFLECTOR_BASH_GUARD=0 skips codex and allows the command", async () => {
-		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
-		const invokeLog = join(binDir, "invoked.log");
-		writeFileSync(
-			join(binDir, "codex"),
-			`#!/bin/sh\necho $$ >> ${JSON.stringify(invokeLog)}\nexit 1\n`,
-		);
-		chmodSync(join(binDir, "codex"), 0o755);
-		const prevPath = process.env.PATH ?? "";
-		const prevGuard = process.env.CODEX_REFLECTOR_BASH_GUARD;
-		process.env.PATH = `${binDir}:${prevPath}`;
-		process.env.CODEX_REFLECTOR_BASH_GUARD = "0";
-		try {
-			const { pi, handlers } = makePi();
-			codexReflector(pi);
-			const result = await handlers.get("tool_call")?.(
-				{
-					type: "tool_call",
-					toolName: "bash",
-					toolCallId: "id",
-					input: { command: "rm -rf /tmp/x" },
-				},
-				{ cwd: ".", hasUI: false, ui: { notify() {} } },
-			);
-			expect(result).toBeUndefined();
-			expect(existsSync(invokeLog)).toBe(false);
-		} finally {
-			process.env.PATH = prevPath;
-			if (prevGuard === undefined) delete process.env.CODEX_REFLECTOR_BASH_GUARD;
-			else process.env.CODEX_REFLECTOR_BASH_GUARD = prevGuard;
-			rmSync(binDir, { recursive: true, force: true });
+			testSetJudge(undefined);
 		}
 	});
-
-	test("bash guard prescreen passes benign command without codex", async () => {
-		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
-		const invokeLog = join(binDir, "invoked.log");
-		writeFileSync(
-			join(binDir, "codex"),
-			`#!/bin/sh\necho $$ >> ${JSON.stringify(invokeLog)}\nexit 1\n`,
-		);
-		chmodSync(join(binDir, "codex"), 0o755);
-		const prevPath = process.env.PATH ?? "";
-		const prevGuard = process.env.CODEX_REFLECTOR_BASH_GUARD;
-		process.env.PATH = `${binDir}:${prevPath}`;
-		process.env.CODEX_REFLECTOR_BASH_GUARD = "1";
-		try {
-			const { pi, handlers } = makePi();
-			codexReflector(pi);
-			const result = await handlers.get("tool_call")?.(
-				{
-					type: "tool_call",
-					toolName: "bash",
-					toolCallId: "id",
-					input: { command: "git status" },
-				},
-				{ cwd: ".", hasUI: false, ui: { notify() {} } },
-			);
-			expect(result).toBeUndefined();
-			expect(existsSync(invokeLog)).toBe(false);
-		} finally {
-			process.env.PATH = prevPath;
-			if (prevGuard === undefined) delete process.env.CODEX_REFLECTOR_BASH_GUARD;
-			else process.env.CODEX_REFLECTOR_BASH_GUARD = prevGuard;
-			rmSync(binDir, { recursive: true, force: true });
-		}
-	});
-
-	test("tool_call bash guard is disabled by default (opt-in)", async () => {
-		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
-		const invokeLog = join(binDir, "invoked.log");
-		writeFileSync(
-			join(binDir, "codex"),
-			`#!/bin/sh\necho $$ >> ${JSON.stringify(invokeLog)}\nexit 0\n`,
-		);
-		chmodSync(join(binDir, "codex"), 0o755);
-		const prevPath = process.env.PATH ?? "";
-		const prevGuard = process.env.CODEX_REFLECTOR_BASH_GUARD;
-		process.env.PATH = `${binDir}:${prevPath}`;
-		delete process.env.CODEX_REFLECTOR_BASH_GUARD;
-		try {
-			const { pi, handlers } = makePi();
-			codexReflector(pi);
-			const handler = handlers.get("tool_call");
-			expect(handler).toBeDefined();
-			const result = await handler?.(
-				{
-					type: "tool_call",
-					toolName: "bash",
-					toolCallId: "id",
-					input: { command: "rm -rf /" },
-				},
-				{ cwd: ".", hasUI: false, ui: { notify() {} } },
-			);
-			expect(result).toBeUndefined();
-			expect(existsSync(invokeLog)).toBe(false);
-		} finally {
-			process.env.PATH = prevPath;
-			if (prevGuard === undefined) delete process.env.CODEX_REFLECTOR_BASH_GUARD;
-			else process.env.CODEX_REFLECTOR_BASH_GUARD = prevGuard;
-			rmSync(binDir, { recursive: true, force: true });
-		}
-	});
-	test("bash pre-guard invokes luna at low effort", async () => {
-		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
-		const argsLog = join(binDir, "args.log");
-		writeFileSync(
-			join(binDir, "codex"),
-			`#!/bin/sh
-printf '%s\\n' "$*" >> ${JSON.stringify(argsLog)}
-out=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -o) out="$2"; shift 2 ;;
-    *) shift ;;
-  esac
-done
-[ -n "$out" ] && printf 'PASS\\n' > "$out"
-exit 0
-`,
-		);
-		chmodSync(join(binDir, "codex"), 0o755);
-		const prevPath = process.env.PATH ?? "";
-		const prevModel = process.env.CODEX_REFLECTOR_MODEL;
-		const prevGuard = process.env.CODEX_REFLECTOR_BASH_GUARD;
-		process.env.PATH = `${binDir}:${prevPath}`;
-		delete process.env.CODEX_REFLECTOR_MODEL;
-		process.env.CODEX_REFLECTOR_BASH_GUARD = "1";
-		try {
-			const { pi, handlers } = makePi();
-			codexReflector(pi);
-			const result = await handlers.get("tool_call")?.(
-				{
-					type: "tool_call",
-					toolName: "bash",
-					toolCallId: "id",
-					input: { command: "rm -rf /tmp/x" },
-				},
-				{ cwd: ".", hasUI: false, ui: { notify() {} } },
-			);
-			expect(result).toBeUndefined();
-			const argsLines = readFileSync(argsLog, "utf8").trim().split("\n");
-			expect(argsLines).toHaveLength(1);
-			expect(argsLines[0]).toContain("-m gpt-5.6-luna");
-			expect(argsLines[0]).toContain("model_reasoning_effort=low");
-		} finally {
-			process.env.PATH = prevPath;
-			if (prevModel === undefined) delete process.env.CODEX_REFLECTOR_MODEL;
-			else process.env.CODEX_REFLECTOR_MODEL = prevModel;
-			if (prevGuard === undefined) delete process.env.CODEX_REFLECTOR_BASH_GUARD;
-			else process.env.CODEX_REFLECTOR_BASH_GUARD = prevGuard;
-			rmSync(binDir, { recursive: true, force: true });
-		}
-	}, 15_000);
-	test("tool_result fails open when codex hangs (deadline SIGKILLs the child)", async () => {
-		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
-		const fake = join(binDir, "codex");
-		const pidFile = join(binDir, "codex.pid");
-		// echo $$ before exec so the pid file holds the (exec-preserved) sleep PID.
-		writeFileSync(fake, `#!/bin/sh\necho $$ > "${pidFile}"\nexec sleep 30\n`);
-		chmodSync(fake, 0o755);
-		const prevPath = process.env.PATH ?? "";
-		process.env.PATH = `${binDir}:${prevPath}`;
-		testSetHandlerBudgetMs(300); // deadline fires at 300ms (> spawn+log, << the 5s assert / 25s guard)
-		try {
-			const { pi, handlers } = makePi();
-			codexReflector(pi);
-			const handler = handlers.get("tool_result");
-			expect(handler).toBeDefined();
-			const event = {
-				type: "tool_result",
-				toolName: "write",
-				toolCallId: "id",
-				input: { path: "x.ts", content: "const a = 1;" },
-				content: [],
-				isError: false,
-			} as unknown as Parameters<NonNullable<typeof handler>>[0];
-			const ctx = { cwd: ".", hasUI: false, ui: { notify() {} } } as unknown as Parameters<
-				NonNullable<typeof handler>
-			>[1];
-			const start = Date.now();
-			const result = await handler?.(event, ctx);
-			const elapsed = Date.now() - start;
-			expect(result).toBeUndefined(); // fail-open: no review override
-			expect(elapsed).toBeLessThan(5_000); // 100ms deadline fired, not the 25s guard
-			// The deadline must actually SIGKILL the spawned child, not merely resolve.
-			expect(existsSync(pidFile)).toBe(true);
-			const pid = Number.parseInt(readFileSync(pidFile, "utf8").trim(), 10);
-			expect(Number.isInteger(pid)).toBe(true);
-			expect(await waitForPidGone(pid, 4_000)).toBe(true);
-		} finally {
-			process.env.PATH = prevPath;
-			testSetHandlerBudgetMs(HANDLER_BUDGET_MS);
-			rmSync(binDir, { recursive: true, force: true });
-		}
-	}, 15_000);
-	test("tool_result deadline also aborts the matryoshka compaction codex call", async () => {
-		// A snippet > MAX_COMPACT_CHARS (400_000) forces compactSnippet → matryoshkaCompact →
-		// codex, exercising the *indirect* codex path. A non-empty invoke log proves matryoshka
-		// actually spawned codex (not a tautological early return); drop the signal forwarding into
-		// matryoshkaCompact and that hung call blocks on the 25s CODEX_TIMEOUT, blowing the 15s
-		// timeout. (The later review call is killed by invokeCodex's post-spawn aborted check
-		// regardless of the line-350 early-spawn guard, so this does not exercise that guard.)
-		const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
-		const invokeLog = join(binDir, "invoked.log");
-		writeFileSync(join(binDir, "codex"), `#!/bin/sh\necho $$ >> "${invokeLog}"\nexec sleep 30\n`);
-		chmodSync(join(binDir, "codex"), 0o755);
-		const prevPath = process.env.PATH ?? "";
-		process.env.PATH = `${binDir}:${prevPath}`;
-		testSetHandlerBudgetMs(300); // > redact+spawn of the 420K snippet, << the 5s assert / 25s guard
-		try {
-			const { pi, handlers } = makePi();
-			codexReflector(pi);
-			const handler = handlers.get("tool_result");
-			expect(handler).toBeDefined();
-			const event = {
-				type: "tool_result",
-				toolName: "write",
-				toolCallId: "id",
-				input: { path: "big.ts", content: "a".repeat(420_000) },
-				content: [],
-				isError: false,
-			} as unknown as Parameters<NonNullable<typeof handler>>[0];
-			const ctx = { cwd: ".", hasUI: false, ui: { notify() {} } } as unknown as Parameters<
-				NonNullable<typeof handler>
-			>[1];
-			const start = Date.now();
-			const result = await handler?.(event, ctx);
-			const elapsed = Date.now() - start;
-			expect(result).toBeUndefined();
-			expect(elapsed).toBeLessThan(5_000);
-			expect(existsSync(invokeLog)).toBe(true); // matryoshka actually invoked codex (indirect path)
-			for (const line of readFileSync(invokeLog, "utf8").split("\n")) {
-				const pid = Number.parseInt(line.trim(), 10);
-				if (Number.isInteger(pid)) expect(await waitForPidGone(pid, 4_000)).toBe(true);
-			}
-		} finally {
-			process.env.PATH = prevPath;
-			testSetHandlerBudgetMs(HANDLER_BUDGET_MS);
-			rmSync(binDir, { recursive: true, force: true });
-		}
-	}, 15_000);
-
-	// Every handler route with its own final invokeCodex(..., signal) call must fail open under
-	// the deadline when codex hangs. Drop the signal arg from any one route's call and invokeCodex
-	// gets no extraSignal — neither the early guard (codex-reflector.ts:350) nor the post-spawn
-	// kill (:395-402) runs — so that route blocks on the 25s CODEX_TIMEOUT and blows the 15s
-	// timeout. The invoke-log assertion guards against a mis-shaped event short-circuiting to
-	// undefined before reaching invokeCodex (which would pass tautologically).
-	const HANGING_ROUTES: ReadonlyArray<{ label: string; handler: string; event: Record<string, unknown> }> = [
-		{
-			label: "tool_result/thinking",
-			handler: "tool_result",
-			event: { type: "tool_result", toolName: "mcp__sequentialthinking", toolCallId: "id", input: { thought: "x" }, content: [], isError: false },
-		},
-		{
-			label: "tool_result/bash_failure",
-			handler: "tool_result",
-			event: { type: "tool_result", toolName: "bash", toolCallId: "id", input: { command: "ls" }, content: [{ type: "text", text: "boom" }], isError: true },
-		},
-		{
-			label: "tool_call/bash_guard",
-			handler: "tool_call",
-			event: { type: "tool_call", toolName: "bash", toolCallId: "id", input: { command: "rm -rf /tmp/x" } },
-		},
-		{
-			label: "tool_result/code_change_failure",
-			handler: "tool_result",
-			event: { type: "tool_result", toolName: "mcp__morph__edit_file", toolCallId: "id", input: { path: "x.ts", code_edit: "EDIT", instruction: "DO" }, content: [], isError: true },
-		},
-		{
-			label: "session_stop (nonempty transcript)",
-			handler: "session_stop",
-			event: { type: "session_stop", messages: [{ role: "user", content: "hello" }, { role: "assistant", content: "did work" }], turn_id: 1, session_id: "s", stop_hook_active: false },
-		},
-		{
-			label: "session_before_compact (nonempty transcript)",
-			handler: "session_before_compact",
-			event: { type: "session_before_compact", preparation: { messagesToSummarize: [{ role: "user", content: "work to reflect on" }] } },
-		},
-	];
-	for (const route of HANGING_ROUTES) {
-		test(`route ${route.label} fails open when codex hangs`, async () => {
-			const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
-			const invokeLog = join(binDir, "invoked.log");
-			writeFileSync(join(binDir, "codex"), `#!/bin/sh\necho $$ >> "${invokeLog}"\nexec sleep 30\n`);
-			chmodSync(join(binDir, "codex"), 0o755);
-			const prevPath = process.env.PATH ?? "";
-			const prevGuard = process.env.CODEX_REFLECTOR_BASH_GUARD;
-			const prevStopReview = process.env.CODEX_REFLECTOR_STOP_REVIEW;
-			process.env.PATH = `${binDir}:${prevPath}`;
-			if (route.handler === "tool_call") {
-				process.env.CODEX_REFLECTOR_BASH_GUARD = "1";
-			} else if (route.handler === "session_stop") {
-				process.env.CODEX_REFLECTOR_STOP_REVIEW = "1";
-			}
-			testSetHandlerBudgetMs(300); // > spawn+log time, << the 5s assert / 25s guard
-			try {
-				const { pi, handlers } = makePi();
-				codexReflector(pi);
-				const handler = handlers.get(route.handler);
-				expect(handler).toBeDefined();
-				const ctx = { cwd: ".", hasUI: false, ui: { notify() {} } };
-				const start = Date.now();
-				const result = await handler?.(route.event, ctx);
-				const elapsed = Date.now() - start;
-				expect(result).toBeUndefined(); // fail-open on every route
-				expect(elapsed).toBeLessThan(5_000); // deadline fired, not the 25s guard
-				expect(existsSync(invokeLog)).toBe(true); // route actually reached invokeCodex
-				// The deadline must SIGKILL the spawned child, not just resolve — else a broken
-				// abort path leaks a sleep-30 child. Poll each logged PID (resolve precedes close).
-				for (const line of readFileSync(invokeLog, "utf8").split("\n")) {
-					const pid = Number.parseInt(line.trim(), 10);
-					if (Number.isInteger(pid)) expect(await waitForPidGone(pid, 4_000)).toBe(true);
-				}
-			} finally {
-				process.env.PATH = prevPath;
-				if (prevGuard === undefined) delete process.env.CODEX_REFLECTOR_BASH_GUARD;
-				else process.env.CODEX_REFLECTOR_BASH_GUARD = prevGuard;
-				if (prevStopReview === undefined) delete process.env.CODEX_REFLECTOR_STOP_REVIEW;
-				else process.env.CODEX_REFLECTOR_STOP_REVIEW = prevStopReview;
-				testSetHandlerBudgetMs(HANDLER_BUDGET_MS);
-				rmSync(binDir, { recursive: true, force: true });
-			}
-		}, 15_000);
-	}
-
-	// Each builder route threads `signal` into its OWN matryoshkaCompact(..., signal) call
-	// (see the builder functions in codex-reflector.ts), separate from the final invokeCodex
-	// that HANGING_ROUTES covers. With tiny inputs those compaction calls return early (text <=
-	// maxChars) and never spawn codex, so the tiny table cannot catch a dropped signal there.
-	// Feed each route an input ABOVE its builder's matryoshkaCompact maxChars threshold so the
-	// builder's own compaction call spawns codex and the deadline must SIGKILL it — mirroring
-	// the 420K compactSnippet test for the remaining builder routes. Sizes account for the 8000
-	// per-part / per-message cap in textOf/renderTranscript (thinking reads input.thought raw).
-	const HANGING_COMPACTION_ROUTES: ReadonlyArray<{ label: string; handler: string; event: Record<string, unknown> }> = [
-		{
-			label: "tool_result/thinking (thought > 100k compaction threshold)",
-			handler: "tool_result",
-			event: { type: "tool_result", toolName: "mcp__sequentialthinking", toolCallId: "id", input: { thought: "a".repeat(110_000) }, content: [], isError: false },
-		},
-		{
-			label: "tool_result/bash_failure (error > 20k compaction threshold)",
-			handler: "tool_result",
-			event: { type: "tool_result", toolName: "bash", toolCallId: "id", input: { command: "ls" }, content: Array.from({ length: 4 }, () => ({ type: "text", text: "a".repeat(8000) })), isError: true },
-		},
-		{
-			label: "tool_call/bash_guard (command > 400k compaction threshold)",
-			handler: "tool_call",
-			event: {
-				type: "tool_call",
-				toolName: "bash",
-				toolCallId: "id",
-				input: { command: `rm -rf /tmp/${"a".repeat(410_000)}` },
-			},
-		},
-		{
-			label: "session_stop (transcript > 400k compaction threshold)",
-			handler: "session_stop",
-			event: { type: "session_stop", messages: Array.from({ length: 55 }, () => ({ role: "user", content: "a".repeat(8000) })), turn_id: 1, session_id: "s", stop_hook_active: false },
-		},
-		{
-			label: "session_before_compact (transcript > 400k compaction threshold)",
-			handler: "session_before_compact",
-			event: { type: "session_before_compact", preparation: { messagesToSummarize: Array.from({ length: 55 }, () => ({ role: "user", content: "a".repeat(8000) })) } },
-		},
-	];
-	for (const route of HANGING_COMPACTION_ROUTES) {
-		test(`route ${route.label} fails open when the builder's matryoshka codex call hangs`, async () => {
-			const binDir = mkdtempSync(join(tmpdir(), "codex-ref-fakebin-"));
-			const invokeLog = join(binDir, "invoked.log");
-			writeFileSync(join(binDir, "codex"), `#!/bin/sh\necho $$ >> "${invokeLog}"\nexec sleep 30\n`);
-			chmodSync(join(binDir, "codex"), 0o755);
-			const prevPath = process.env.PATH ?? "";
-			const prevGuard = process.env.CODEX_REFLECTOR_BASH_GUARD;
-			const prevStopReview = process.env.CODEX_REFLECTOR_STOP_REVIEW;
-			process.env.PATH = `${binDir}:${prevPath}`;
-			if (route.handler === "tool_call") {
-				process.env.CODEX_REFLECTOR_BASH_GUARD = "1";
-			} else if (route.handler === "session_stop") {
-				process.env.CODEX_REFLECTOR_STOP_REVIEW = "1";
-			}
-			testSetHandlerBudgetMs(300); // > redact+spawn of the large input, << the 5s assert / 25s guard
-			try {
-				const { pi, handlers } = makePi();
-				codexReflector(pi);
-				const handler = handlers.get(route.handler);
-				expect(handler).toBeDefined();
-				const ctx = { cwd: ".", hasUI: false, ui: { notify() {} } };
-				const start = Date.now();
-				const result = await handler?.(route.event, ctx);
-				const elapsed = Date.now() - start;
-				expect(result).toBeUndefined(); // fail-open on the indirect compaction path
-				expect(elapsed).toBeLessThan(5_000); // deadline fired, not the 25s guard
-				expect(existsSync(invokeLog)).toBe(true); // the builder's matryoshkaCompact actually spawned codex
-				// The deadline must SIGKILL each spawned child (matryoshka's, plus the final
-				// invoke if it spawned), not merely resolve. Poll each logged PID.
-				for (const line of readFileSync(invokeLog, "utf8").split("\n")) {
-					const pid = Number.parseInt(line.trim(), 10);
-					if (Number.isInteger(pid)) expect(await waitForPidGone(pid, 4_000)).toBe(true);
-				}
-			} finally {
-				process.env.PATH = prevPath;
-				if (prevGuard === undefined) delete process.env.CODEX_REFLECTOR_BASH_GUARD;
-				else process.env.CODEX_REFLECTOR_BASH_GUARD = prevGuard;
-				if (prevStopReview === undefined) delete process.env.CODEX_REFLECTOR_STOP_REVIEW;
-				else process.env.CODEX_REFLECTOR_STOP_REVIEW = prevStopReview;
-				testSetHandlerBudgetMs(HANDLER_BUDGET_MS);
-				rmSync(binDir, { recursive: true, force: true });
-			}
-		}, 15_000);
-	}
 });
 
 describe("handlerDeadline", () => {
 	test("aborts after the budget elapses", async () => {
 		const d = handlerDeadline(undefined, 10);
 		expect(d.signal.aborted).toBe(false);
-		await new Promise<void>((r) =>
-			d.signal.addEventListener("abort", () => r(), { once: true }),
-		);
+		const { promise, resolve } = Promise.withResolvers<void>();
+		d.signal.addEventListener("abort", () => resolve(), { once: true });
+		await promise;
 		expect(d.signal.aborted).toBe(true);
 		d.clear();
 	});
@@ -1550,45 +1410,45 @@ describe("resolveDeviceWrite", () => {
 		).toBeNull();
 	});
 
-	test("details.xdev preserves every existing route and skips unrelated devices", () => {
+	test("details.xdev unwraps every device tool; only edit tools route to review", () => {
 		const cases = [
 			{
 				tool: "ast_edit",
 				input: { paths: ["src/a.ts"], ops: [] },
 				isError: false,
-				category: "code_change",
+				reviewed: true,
 			},
 			{
 				tool: "mcp__sequential__sequentialthinking",
 				input: { thought: "check boundary" },
 				isError: false,
-				category: "thinking",
+				reviewed: false,
 			},
-			{ tool: "bash", input: { command: "false" }, isError: true, category: "bash_failure" },
-			{ tool: "fastcompact", input: { location: "README.md" }, isError: false, category: null },
-			{ tool: "resolve", input: {}, isError: false, category: null },
-			{ tool: "reject", input: {}, isError: false, category: null },
-			{ tool: "propose", input: {}, isError: false, category: null },
+			{ tool: "bash", input: { command: "false" }, isError: true, reviewed: false },
+			{ tool: "fastcompact", input: { location: "README.md" }, isError: false, reviewed: false },
+			{ tool: "resolve", input: {}, isError: false, reviewed: false },
+			{ tool: "reject", input: {}, isError: false, reviewed: false },
+			{ tool: "propose", input: {}, isError: false, reviewed: false },
 		] as const;
 
-		for (const { tool, input, isError, category } of cases) {
+		for (const { tool, input, isError, reviewed } of cases) {
 			const r = resolveDeviceWrite(
 				evt("write", { path: `xd://${tool}`, content: "not json" }, isError, {
 					xdev: { tool, mode: "execute", args: input, inner: {} },
 				}),
 			);
 			expect(r).not.toBeNull();
-			if (r) expect(classify(r.toolName, r.isError, r.input)?.category ?? null).toBe(category);
+			if (r) expect(isCodeChangeTool(r.toolName)).toBe(reviewed);
 		}
 	});
 
-	test("xd://fastcompact unwraps but classify() still skips it", () => {
+	test("xd://fastcompact unwraps but isCodeChangeTool skips it", () => {
 		const r = resolveDeviceWrite(
 			evt("write", { path: "xd://fastcompact", content: JSON.stringify({ location: "README.md" }) }),
 		);
 		expect(r).not.toBeNull();
 		expect(r?.toolName).toBe("fastcompact");
-		if (r) expect(classify(r.toolName, false, r.input)).toBeNull();
+		if (r) expect(isCodeChangeTool(r.toolName)).toBe(false);
 	});
 
 	test("failed xd:// device write is skipped (null)", () => {
@@ -1679,16 +1539,16 @@ describe("stopReviewDecision", () => {
 });
 
 describe("bashGuardDecision", () => {
-	test("FAIL blocks with the guard review as reason", () => {
-		const result = bashGuardDecision("FAIL", "destroys data outside workspace");
-		expect(result).toEqual({
+	test("blocks at BLOCK_AT with the contract reason", () => {
+		expect(bashGuardDecision(0.9, "destroys data outside the workspace", "jev-1.14.0")).toEqual({
 			block: true,
-			reason: expect.stringContaining("Codex Bash Guard FAIL"),
+			reason:
+				"Blocked by decision model: the command destroys data outside the workspace (P=0.90). Judged by jev-1.14.0.",
 		});
 	});
-	test("PASS and UNCERTAIN fail open", () => {
-		expect(bashGuardDecision("PASS", "safe")).toBeUndefined();
-		expect(bashGuardDecision("UNCERTAIN", "still checking")).toBeUndefined();
+	test("fails open below BLOCK_AT", () => {
+		expect(bashGuardDecision(0.8999, "anything", "m")).toBeUndefined();
+		expect(bashGuardDecision(0, "anything", "m")).toBeUndefined();
 	});
 });
 
@@ -1731,4 +1591,70 @@ describe("bashGuardPrescreen", () => {
 			expect(bashGuardPrescreen(cmd)).toBe(true);
 		});
 	}
+});
+
+describe("cross-surface judge contract", () => {
+	const PYTHON_SURFACE = join(import.meta.dir, "..", "scripts", "codex-reflector.py");
+	const DUMP = `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("reflector", sys.argv[1])
+surface = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(surface)
+cases = json.load(sys.stdin)
+print(json.dumps({
+    "questions": {name: surface.build_questions(route, file) for name, (route, file) in cases["questions"].items()},
+    "thresholds": [surface.FAIL_AT_ADVISORY, surface.PASS_BELOW, surface.BLOCK_AT, surface.STATE_MAX_CHARS],
+    "fitted": surface._fit_state(cases["long_text"]),
+    "judged": [
+        [surface.derive_verdict(route, answers), surface.render_scorecard(route, answers, "jev-1.14.0")]
+        for route, answers in cases["judged"]
+    ],
+}))
+`;
+	const UI_CLEAN = { layout: scoreAnswer(CLEAN), animation: scoreAnswer(CLEAN), accessibility: scoreAnswer(CLEAN) };
+	const JUDGED: ReadonlyArray<[Route, Record<string, Answer>]> = [
+		["write", writeAnswers()],
+		["write", writeAnswers({ correctness: scoreAnswer({ "0": 0.7, "1": 0.2, "2": 0.1 }) })],
+		["write", writeAnswers({ correctness: scoreAnswer({ "0": 0.6999, "1": 0.2, "2": 0.1001 }) })],
+		["write", writeAnswers({ has_placeholder: noulAnswer(0.9) })],
+		["write", writeAnswers({ has_placeholder: noulAnswer(0.4) })],
+		["write", writeAnswers({ is_executable_code: noulAnswer(0.2), performance: scoreAnswer({ "0": 0.95, "1": 0.03, "2": 0.02 }) })],
+		["write", writeAnswers({ touches_shared_state: noulAnswer(0.2), concurrency: scoreAnswer({ "0": 0.95, "1": 0.03, "2": 0.02 }) })],
+		["write", writeAnswers({ slop: scoreAnswer({ "0": 0.05, "1": 0.93, "2": 0.02 }) })],
+		["write", writeAnswers({ ...UI_CLEAN, layout: scoreAnswer({ "0": 0.84, "1": 0.1, "2": 0.06 }) })],
+		["plan", dimensionAnswers({ design: scoreAnswer({ "0": 0.35, "1": 0.05, "2": 0.6 }) })],
+		["plan", dimensionAnswers({ design: scoreAnswer({ "0": 0.05, "1": 0.475, "2": 0.475 }) })],
+		["stop", dimensionAnswers({ correctness: scoreAnswer({ "0": 0.9, "1": 0.05, "2": 0.05 }) })],
+		["stop", dimensionAnswers({ correctness: scoreAnswer({ "0": 0.8999, "1": 0.05, "2": 0.0501 }) })],
+	];
+
+	test("the Python surface builds the same questions, thresholds, verdicts, and scorecards", () => {
+		const questionCases: Record<string, [Route, string]> = {
+			write: ["write", "src/a.py"],
+			writeUi: ["write", "src/Page.TSX"],
+			writeDotfile: ["write", "site/.html"],
+			writeDottedDirectory: ["write", "pkg.css/Makefile"],
+			plan: ["plan", ""],
+			stop: ["stop", ""],
+		};
+		const longText = `${"a".repeat(40_000)}${"b".repeat(40_000)}`;
+		const dumped = spawnSync("python3", ["-c", DUMP, PYTHON_SURFACE], {
+			input: JSON.stringify({ questions: questionCases, long_text: longText, judged: JUDGED }),
+			encoding: "utf8",
+		});
+		expect({ error: dumped.error, status: dumped.status, stderr: dumped.stderr }).toEqual({
+			error: undefined,
+			status: 0,
+			stderr: "",
+		});
+		const python = JSON.parse(dumped.stdout);
+		for (const [name, [route, file]] of Object.entries(questionCases)) {
+			expect(python.questions[name]).toEqual(buildQuestions(route, file));
+		}
+		expect(python.thresholds).toEqual([0.7, 0.3, 0.9, STATE_MAX_CHARS]);
+		expect(python.fitted).toBe(fitState(longText));
+		expect(python.judged).toEqual(
+			JUDGED.map(([route, answers]) => [deriveVerdict(route, answers), renderScorecard(route, answers, "jev-1.14.0")]),
+		);
+	});
 });

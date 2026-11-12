@@ -1,6 +1,6 @@
 {
   "name": "odin-reflector",
-  "version": "1.2.5",
+  "version": "2.0.0",
   "description": "Marketplace metadata for the codex-reflector plugin",
   "owner": {
     "name": "cognitive-glitch",
@@ -14,14 +14,15 @@
     {
       "name": "codex-reflector",
       "source": "./",
-      "version": "1.2.5",
-      "description": "Codex CLI reflector for independent second-model review in Claude Code and Cursor",
+      "version": "2.0.0",
+      "description": "Codex reflector: decision-model scorecards for writes, plans, and stops, with an opt-in bash guard on oh-my-pi",
       "author": {
         "name": "cognitive-glitch"
       },
       "tags": [
         "codex",
         "reflector",
+        "decision-model",
         "hooks",
         "cursor",
         "claude"
