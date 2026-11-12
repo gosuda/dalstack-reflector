@@ -1,29 +1,30 @@
-# Outline-Driven Development — Reflector
+# Outline-Driven Development: Reflector
 
-> Codex CLI meta-reflection layer for Outline-Driven Development. Add-on for the Claude Code plugin, with a native oh-my-pi port.
+> Review layer for Outline-Driven Development. Add-on for the Claude Code plugin, with a native oh-my-pi port.
 
 **Methodology**: [outline-driven-development](https://github.com/OutlineDriven/outline-driven-development) &nbsp;·&nbsp; **Claude Code plugin**: [odin-claude-plugin](https://github.com/OutlineDriven/odin-claude-plugin) &nbsp;·&nbsp; **Site**: [outlinedriven.github.io](https://outlinedriven.github.io)
 
 ---
 
-Independent critic, oracle, and metacognition layer using OpenAI Codex CLI.
+Independent critic and oracle for coding agents.
 
-The agent acts. Codex reviews. Every code change gets a second opinion. Every thinking step gets metacognitive reflection from a different model family.
+The agent acts. A decision model judges changes, plans, stops, and risky commands. Code changes get a second opinion by default.
 
 ## Requirements
 
-- [Codex CLI](https://github.com/openai/codex) on PATH (`codex exec` must work) — required by **both** surfaces.
+- **oh-my-pi (omp)**: a working `judge` model role (`modelRoles.judge`). It answers the review questions.
+- **Claude Code plugin (Python)**: `TYPESAFE_API_KEY` in the environment. Python 3.8+, standard library only. The judge calls go to the TypeSafe decision-model API.
 
 The reflector ships in two surfaces; install whichever matches your agent:
 
-- **[Claude Code plugin](#claude-code-plugin)** — the original single-file Python hook. Needs Python 3.8+ (stdlib only, no pip dependencies).
-- **[oh-my-pi (omp)](#oh-my-pi-omp)** — a native TypeScript port, no Python runtime. Needs the `omp` CLI.
+- **[Claude Code plugin](#claude-code-plugin)**: the original single-file Python hook. Needs Python 3.8+ (stdlib only, no pip dependencies).
+- **[oh-my-pi (omp)](#oh-my-pi-omp)**: a native TypeScript port, no Python runtime. Needs the `omp` CLI.
 
 ---
 
 ## Claude Code plugin
 
-A single-file Python hook (`scripts/codex-reflector.py`, stdlib only) wired through `hooks/hooks.json`. Requires Python 3.8+.
+A single-file Python hook (`scripts/codex-reflector.py`, stdlib only) wired through `hooks/hooks.json`. Requires Python 3.8+ and `TYPESAFE_API_KEY` in the environment.
 
 ### Install
 
@@ -49,11 +50,9 @@ Place this plugin at `~/.claude/codex-reflector/` and restart Claude Code.
 
 | Event | Trigger | Mode | Purpose |
 |---|---|---|---|
-| PostToolUse | Write, Edit, morph-edit | async | Code review with PASS/FAIL/UNCERTAIN verdict |
-| PostToolUse | sequential-thinking, actor-critic, shannon | sync | Metacognitive reflection (advisory, no verdict) |
-| PostToolUseFailure | Bash | async | Root cause diagnosis for failed commands |
-| Stop | Agent finishing | sync | Fresh holistic review; blocks on FAIL only (PASS/UNCERTAIN settle) |
-| PreCompact | Context compaction | sync | Summarizes critical session context |
+| PostToolUse | Write, Edit, Fast-Apply MCP edit | async | Decision-model scorecard review (PASS/FAIL/UNCERTAIN) |
+| PostToolUse | ExitPlanMode | async | Decision-model plan review, advisory (PASS/FAIL/UNCERTAIN) |
+| Stop | Agent finishing | sync | Fresh judge review; blocks on FAIL only (PASS/UNCERTAIN settle) |
 
 ### Use with Cursor
 
@@ -96,16 +95,15 @@ When this repository itself is opened in Cursor, the checked-in `.claude/setting
 
 Cursor compatibility notes:
 
-- `PostToolUse`, `Stop`, and `PreCompact` run through Cursor's Claude hook compatibility.
-- `PostToolUseFailure` is included in the export for Claude parity, but Cursor does not currently list it in its Claude hook mapping table.
-- Cursor treats Claude `Stop` blocks as follow-up messages, so a FAIL Stop review causes the agent to continue with Codex feedback instead of hard-stopping the UI.
+- `PostToolUse` and `Stop` run through Cursor's Claude hook compatibility.
+- Cursor treats Claude `Stop` blocks as follow-up messages, so a blocked Stop review causes the agent to continue with the judge's reason instead of hard-stopping the UI.
 - The direct export mirrors the Claude plugin matcher. Cursor only fires the parts whose tool names are exposed through its Claude hook compatibility layer.
 
 ---
 
 ## oh-my-pi (omp)
 
-A native TypeScript port of this reflector ships at `omp/codex-reflector.ts` — no Python runtime; it calls `codex exec` directly. It registers oh-my-pi extension handlers that mirror the Claude plugin: code review on `write`/`edit`/`ast_edit` and Fast-Apply MCP edits, root-cause diagnostics on failed `bash` and Fast-Apply calls, metacognitive reflection on thinking-MCP steps (`sequential`, `shannon`), and a pre-compaction session summary.
+A native TypeScript port of this reflector ships at `omp/codex-reflector.ts`, with no Python runtime. It registers oh-my-pi extension handlers that mirror the plugin: a scorecard review on `write`/`edit`/`ast_edit` and Fast-Apply MCP edits, an opt-in Stop gate, and an opt-in bash guard.
 
 ### Installation Guide
 
@@ -136,72 +134,110 @@ omp --profile <profile> plugin install https://github.com/OutlineDriven/odin-ref
 
 ### Behavior
 
-Reads the same [environment variables](#environment-variables) as the Claude plugin. Run the unit tests with `bun test omp/codex-reflector.test.ts`.
+Reads the shared [environment variables](#environment-variables). The `TYPESAFE_*` judge variables are Python-only.
 
-**Behavioral delta from the Claude plugin:** both ports are stateless. Code reviews inject their verdict and full opinion inline for every verdict. On OMP, the pre-execution bash guard (`tool_call`) and holistic Stop gate (`session_stop`) are opt-in and disabled by default; they can be toggled via extension flags (`codex-bash-guard`, `codex-stop-review`) in `/settings` or enabled via env vars (`CODEX_REFLECTOR_BASH_GUARD=1`, `CODEX_REFLECTOR_STOP_REVIEW=1`). When active, the Stop gate performs a fresh holistic review on the native `session_stop` event: only a definitive FAIL blocks; PASS and UNCERTAIN settle (fail-open — never block on uncertainty). It runs once per stop chain: a FAIL returns `{ decision: "block", reason }` so the agent keeps working with that context, then the harness `stop_hook_active` flag settles the re-stop; the native 8-continuation cap is the backstop.
+Run the unit tests with `bun test omp/codex-reflector.test.ts`.
+
+**Behavioral delta from the Claude plugin:** both surfaces are stateless. Scorecard reviews inject their verdict inline every time. On OMP, the pre-execution bash guard (`tool_call`) and the Stop gate (`session_stop`) are opt-in and disabled by default; you can toggle them via extension flags (`codex-bash-guard`, `codex-stop-review`) in `/settings` or enable them via env vars (`CODEX_REFLECTOR_BASH_GUARD=1`, `CODEX_REFLECTOR_STOP_REVIEW=1`). The Python Stop gate is always on, and Python has no bash guard. When active, the Stop gate runs a fresh judge review on the native `session_stop` event: only a FAIL blocks (the worst defect probability at 0.9 or above); PASS and UNCERTAIN settle (fail-open, never block on uncertainty). It runs once per stop chain: a FAIL returns `{ decision: "block", reason }` so the agent keeps working with that context, then the harness `stop_hook_active` flag settles the re-stop; the native 8-continuation cap is the backstop.
 
 ### Hook events
 
 | omp event | Trigger | Mode | Purpose |
 |---|---|---|---|
-| `tool_result` | `write` / `edit` / `ast_edit`, Fast-Apply MCP edit | async | Code review with PASS/FAIL/UNCERTAIN verdict |
-| `tool_result` | `sequential` / `shannon` thinking-MCP steps | sync | Metacognitive reflection (advisory, no verdict) |
-| `tool_result` (`isError`) | failed `bash`, failed Fast-Apply edit | async | Root-cause diagnosis for failed calls |
-| `session_stop` | main agent about to settle | sync | Fresh holistic Stop review once per stop chain (`stop_hook_active` guard); only FAIL blocks (PASS/UNCERTAIN settle); native 8-continuation cap backstop |
-| `session_before_compact` | context compaction | sync | Summarizes critical session context |
+| `tool_result` | `write` / `edit` / `ast_edit` / `fast_edit`, Fast-Apply MCP edit | async | Decision-model scorecard review (PASS/FAIL/UNCERTAIN) |
+| `tool_call` | `bash`, before execution | sync | Opt-in bash guard; five yes/no answers; blocks at 0.9 |
+| `session_stop` | main agent about to settle | sync | Fresh judge review once per stop chain (`stop_hook_active` guard); only FAIL blocks (PASS/UNCERTAIN settle); native 8-continuation cap backstop |
 
 ---
 
 ## Environment Variables
 
-Both surfaces honor the same variables.
+Both surfaces read `CODEX_REFLECTOR_ENABLED` and `CODEX_REFLECTOR_DEBUG`. The `TYPESAFE_*` variables are Python-only. The two gate variables are OMP-only: the Python Stop gate is always on, and Python has no bash guard.
 
 | Variable | Default | Description |
 |---|---|---|
-| `CODEX_REFLECTOR_ENABLED` | `1` | Set to `0` to disable all hooks |
-| `CODEX_REFLECTOR_BASH_GUARD` | `0` (OMP) / `1` (Claude) | Set to `1` on OMP to enable opt-in pre-execution bash guard (`0` disables) |
-| `CODEX_REFLECTOR_STOP_REVIEW` | `0` (OMP) / `1` (Claude) | Set to `1` on OMP to enable opt-in holistic stop reflection gate (`0` disables) |
-| `CODEX_REFLECTOR_MODEL` | _(codex default)_ | Override model for `codex exec` |
-| `CODEX_REFLECTOR_DEBUG` | `0` | Set to `1` for stderr diagnostics |
+| `CODEX_REFLECTOR_ENABLED` | `1` | Set to `0` to disable all hooks (both surfaces) |
+| `CODEX_REFLECTOR_BASH_GUARD` | `0` | OMP only. Set to `1` to enable the opt-in pre-execution bash guard (`0` disables). Python has no bash guard |
+| `CODEX_REFLECTOR_STOP_REVIEW` | `0` (OMP) | OMP only. Set to `1` to enable the opt-in Stop gate (`0` disables). The Python Stop gate is always on |
+| `CODEX_REFLECTOR_DEBUG` | `0` | Set to `1` for diagnostics: on stderr in the Python plugin, in the agent log on oh-my-pi |
+| `TYPESAFE_API_KEY` | _(none)_ | Python only. Required. Bearer token for the TypeSafe decision-model API |
+| `TYPESAFE_BASE_URL` | `https://api.typesafe.ai` | Python only. Judge API base URL |
+| `TYPESAFE_DEFAULT_MODEL` | `jev-1.14.0` | Python only. Judge model id |
 
 ## How It Works
 
-Both surfaces run the same Codex reflection loop and keep no FAIL state — reviews inject their verdict and opinion inline, and the Stop hook runs a fresh holistic review rather than consulting persisted state. The implementation specifics below (`--test-parse`, exit-code blocking) describe the Python plugin; the omp port mirrors the behavior with the [delta noted above](#behavior).
+Both surfaces keep no FAIL state: reviews inject their verdict and scorecard inline, and the Stop gate runs a fresh review rather than consulting persisted state. Every route asks the decision model. The implementation specifics below (exit-code blocking) describe the Python plugin; the omp port mirrors the behavior with the [delta noted above](#behavior).
+
+| Route | Reviews it | Outcome |
+|---|---|---|
+| Write review (Write/Edit tool calls) | Decision model | Scorecard with PASS/FAIL/UNCERTAIN, advisory |
+| Plan review (Python only) | Decision model | Scorecard, advisory |
+| Stop gate (Python always on, OMP opt-in) | Decision model | Scorecard, blocks on FAIL |
+| Bash guard (OMP only, opt-in) | Decision model | Five yes/no answers, blocks at 0.9 |
+
+If the judge does not answer, the route proceeds unreviewed and shows `review skipped: <cause>`. It never blocks.
 
 ### Code Reviews (async)
 
-After Write/Edit tool calls, Codex reviews the change in a read-only sandbox. The verdict (PASS/FAIL/UNCERTAIN) and full opinion are injected inline so the agent sees them on the next turn — returned for every verdict, not just failures. FAIL/UNCERTAIN additionally feed the verdict back as agent context for self-correction.
+After Write/Edit tool calls, the decision model judges the change. It answers scored questions on seven dimensions: correctness, completeness against the stated job, complexity, slop, concurrency, performance, and design. UI files (`.html`, `.htm`, `.css`, `.scss`, `.sass`, `.less`, `.jsx`, `.tsx`, `.vue`, `.svelte`, `.astro`) add layout, animation, and accessibility. The answers become a scorecard, and the reflector injects it inline so the agent sees it on the next turn.
 
-The reflector keeps no FAIL state. Instead the Stop hook runs a fresh holistic review of the session, and only a definitive FAIL blocks (PASS and UNCERTAIN settle — never block on uncertainty): in the Python plugin it runs once per stop chain — a FAIL blocks via exit `2`, then the `stop_hook_active` guard lets a re-stop settle; in omp it likewise runs once per stop chain — a FAIL returns `{ decision: "block", reason }`, then the `stop_hook_active` guard settles the re-stop — with the native 8-continuation cap as backstop.
+The verdict is computed in code from the judge's probabilities:
 
-### Thinking Reflection (sync)
+- FAIL when the worst defect probability reaches the route threshold: 0.7 on the advisory routes (write review, plan review).
+- PASS when the worst defect probability is below 0.3 and no concern is strictly the most likely level on every dimension that still applies.
+- UNCERTAIN otherwise. A dimension that leans to a concrete concern makes the verdict UNCERTAIN, so the agent sees it.
 
-After each thinking MCP tool step (sequential-thinking, actor-critic, shannon), Codex provides immediate metacognitive observations: coherence checks, blind spots, overlooked alternatives, logical gaps. Advisory only — no PASS/FAIL blocking.
+Only the Stop gate and the bash guard can block. The Stop gate blocks on a FAIL, and the bash guard blocks when an answer reaches 0.9. Write and plan reviews are advisory. Both surfaces judge the text of the last assistant message at the Stop gate, and fall back to the transcript only when that message has no text. The Stop gate runs once per stop chain and blocks when the worst defect probability reaches 0.9: in the Python plugin a FAIL blocks via exit `2`, then the `stop_hook_active` guard lets a re-stop settle; in omp a FAIL returns `{ decision: "block", reason }` and the same guard settles the re-stop, with the native 8-continuation cap as backstop.
 
-### Bash Failure Diagnostics (async)
+If the message and the transcript are both empty, the Stop gate settles without a review and without a notice.
 
-When Bash commands fail, Codex diagnoses root cause and suggests remediation steps.
+## The Scorecard
 
-### PreCompact Summary (sync)
+A scorecard is the review text. It starts with the verdict and the file, lists one line per dimension that shows a concern, and names the judge model:
 
-Before context compaction, Codex reads the session transcript tail and produces a summary of key decisions, unresolved issues, current task state, and important file paths.
+```
+Reflector Review ⚠️ FAIL [src/orders.py]:
+- correctness: material defect (P(defect)=0.86) It contains a defect that produces a wrong result, a crash, data loss, or a security hole on a realistic input.
+- slop: concrete concern (P(defect)=0.41) It contains one or two small leftovers, such as an unused import, a stale comment, or a vague name.
+Judged by jev-1.14.0.
+```
 
-## Verdict Parser
+When no dimension shows a concern, the body reads `No dimension shows a material defect (highest P(defect)=0.04).`
 
-The parser extracts PASS/FAIL from Codex's output:
+### Parts
 
-- Strips markdown noise (`**`, backticks, emoji)
-- Checks first 5 non-empty lines for verdict words
-- Supports keyed formats (`Verdict: PASS`, `result=FAIL`)
-- Contradictory signals (both PASS and FAIL) resolve to UNCERTAIN
-- **Fail-open**: PASS and UNCERTAIN never block — only a definitive FAIL blocks, and only at the Stop gate. An UNCERTAIN verdict is always treated as non-blocking.
+A change, a plan, a stop subject, or a command can be over 28,000 bytes after secrets are redacted. The reflector does not cut it. It splits the text into consecutive parts and judges every part with the same questions.
 
-Self-test the parser with `python3 scripts/codex-reflector.py --test-parse` (plugin) or `bun test omp/codex-reflector.test.ts` (omp port).
+The combined verdict is FAIL when any judged part is FAIL. When every part has a verdict, it is PASS when all parts are PASS, and UNCERTAIN otherwise. When a part shows a concern, its scorecard line ends with the part it came from, for example ` (part 3 of 9)`.
+
+Completeness is judged only when the whole subject and the request fit in one part. When the subject alone had to be split, the scorecard holds the line `Completeness was not judged: the subject was split into <n> parts.` When the subject is one part but the request does not fit with it, the line reads `Completeness was not judged: the request does not fit in one part with the subject.`
+
+A FAIL from a judged part stands even when other parts were not judged. The scorecard then holds the line `Parts not judged: <k> of <n> (<cause>).` Without a FAIL, one part without a verdict skips the review with the `review skipped: <cause>` notice.
+
+The thresholds are fixed in code: FAIL at 0.7 on the advisory routes (write review, plan review), PASS below 0.3, block at 0.9 (Stop gate, bash guard).
+
+## Limits
+
+A scorecard names the dimension and the criterion. It does not name the line or the fix; to find the line, read the criterion against the change.
+
+The decision model reads text. Text inside the change it judges can steer it. Treat a scorecard as one signal, the same way you treat any review.
+
+Layout, animation, and accessibility are judged from the source text of UI files. The judge never sees a rendered page.
+
+The reflector does not explain a failed command and does not reflect on thinking steps.
+
+A subject over 28,000 bytes is split into parts, and each part gets one judge call. At most 8 calls run at a time. On oh-my-pi all calls must end inside the 25 second handler budget; in the Python plugin inside 90 seconds. Otherwise the review is skipped with the notice.
+
+The 28,000 byte limit is a size estimate, not a guarantee. Text made mostly of rare characters can be over the context of the judge and be rejected. On oh-my-pi the `judge` role can be a model with a smaller context. A rejected part counts as a failed part; the Python plugin shows `judge request failed: HTTP 400`.
+
+A part is judged without the text around it. A defect that spans two parts can be missed.
+
+The Stop gate does not see your request, only the last answer of the agent.
 
 ## Safety
 
-- **Fail-open**: any internal error approves silently and never blocks the agent — the Python plugin exits `0`; the omp hook returns without a block.
-- **Read-only sandbox**: Codex runs with `--sandbox read-only` — it cannot modify files (both surfaces).
+- **Fail-open**: an internal error or a missing judge answer never blocks the agent. The route proceeds unreviewed with the `review skipped: <cause>` notice; the Python plugin exits `0`, the omp hook returns without a block.
+- **Redaction**: secrets are redacted before any text leaves the process, on the judge path.
 - **Loop prevention**: both surfaces check the `stop_hook_active` flag to run the Stop review once per stop chain, with oh-my-pi's built-in 8-continuation cap as the omp backstop.
 
 ## License

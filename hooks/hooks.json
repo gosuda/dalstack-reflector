@@ -1,5 +1,5 @@
 {
-  "description": "Codex reflector: routes implemented hook events to Python for classification and review",
+  "description": "Reflector: routes implemented hook events to the decision-model judge for write scorecards and Stop gate review",
   "hooks": {
     "PostToolUse": [
       {
@@ -12,29 +12,7 @@
         ]
       }
     ],
-    "PostToolUseFailure": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\"",
-            "timeout": 120
-          }
-        ]
-      }
-    ],
     "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-reflector.py\"",
-            "timeout": 240
-          }
-        ]
-      }
-    ],
-    "PreCompact": [
       {
         "hooks": [
           {

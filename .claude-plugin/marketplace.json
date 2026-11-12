@@ -1,7 +1,7 @@
 {
   "name": "odin-reflector",
-  "version": "1.2.10",
-  "description": "Marketplace for the codex-reflector Claude Code plugin \u2014 independent second-model reviewer using OpenAI Codex CLI",
+  "version": "2.1.1",
+  "description": "Marketplace for the codex-reflector Claude Code plugin: decision-model scorecards for writes, plans, and stops, and an opt-in bash guard on oh-my-pi",
   "owner": {
     "name": "cognitive-glitch",
     "url": "https://github.com/OutlineDriven"
@@ -14,8 +14,8 @@
     {
       "name": "codex-reflector",
       "source": "./",
-      "version": "1.2.10",
-      "description": "Codex CLI reflector \u2014 independent critic, oracle, and metacognition layer using OpenAI Codex as second-model reviewer",
+      "version": "2.1.1",
+      "description": "Codex reflector: decision-model scorecards for writes, plans, and stops, and an opt-in bash guard on oh-my-pi",
       "author": {
         "name": "cognitive-glitch"
       },
@@ -23,14 +23,13 @@
         "codex",
         "reflector",
         "code-review",
-        "metacognition",
-        "second-opinion",
+        "decision-model",
         "hooks"
       ]
     }
   ],
   "metadata": {
-    "lastUpdated": "2026-08-02",
+    "lastUpdated": "2026-11-12",
     "maintainer": "cognitive-glitch",
     "website": "https://github.com/OutlineDriven/codex-reflector",
     "support": "https://github.com/OutlineDriven/codex-reflector/issues"

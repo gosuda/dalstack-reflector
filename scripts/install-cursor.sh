@@ -71,16 +71,9 @@ settings = {
     "hooks": {
         "PostToolUse": [
             {
-                "matcher": "Write|Edit|MultiEdit|Patch|NotebookEdit|ExitPlanMode|mcp__.*morph.*|mcp__.*edit.*|mcp__.*edit_file.*|mcp__.*sequentialthinking.*|mcp__.*sequential_thinking.*|mcp__.*actor-critic.*|mcp__.*shannon.*",
+                "matcher": "Write|Edit|MultiEdit|Patch|NotebookEdit|ExitPlanMode|mcp__.*morph.*|mcp__.*edit.*|mcp__.*edit_file.*",
                 "hooks": [
                     {"type": "command", "command": command, "timeout": 240},
-                ],
-            }
-        ],
-        "PostToolUseFailure": [
-            {
-                "hooks": [
-                    {"type": "command", "command": command, "timeout": 120},
                 ],
             }
         ],
@@ -90,14 +83,7 @@ settings = {
                     {"type": "command", "command": command, "timeout": 240},
                 ],
             }
-        ],
-        "PreCompact": [
-            {
-                "hooks": [
-                    {"type": "command", "command": command, "timeout": 240},
-                ],
-            }
-        ],
+        ]
     }
 }
 
